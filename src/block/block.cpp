@@ -264,17 +264,67 @@ Block::compact(const std::filesystem::path& parent_dir,
         }
     }
 
-    // -------- Sort each series's chunks by min_time + flatten --------------
+    // -------- Vertical merge: dedupe samples by timestamp ------------------
+    // For each series, decode every input chunk's samples, stable-sort by
+    // timestamp (insertion order preserved within ties → later input's
+    // value wins on duplicate t), and re-encode into one or more XOR
+    // chunks. Re-encoding goes through a throwaway MemSeries so the
+    // already-tested head chunk-cutting logic (soft 1 KiB cap, 65 535
+    // sample-count cap) takes care of new chunk boundaries.
     std::vector<SeriesInput> series_inputs;
     series_inputs.reserve(merged.size());
     for (auto& [labels, chunks] : merged) {
-        std::sort(chunks.begin(), chunks.end(),
-                  [](const ChunkInput& a, const ChunkInput& b) {
-                      return a.min_time < b.min_time;
-                  });
+        // Collect every (t, v) sample from every input chunk.
+        std::vector<std::pair<std::int64_t, double>> samples;
+        for (const auto& ci : chunks) {
+            std::vector<std::uint8_t> copy{ci.bytes.begin(), ci.bytes.end()};
+            chunkenc::XORChunk xc = chunkenc::XORChunk::from_bytes(std::move(copy));
+            auto it = xc.iterator();
+            while (it.next()) samples.emplace_back(it.t(), it.v());
+            if (it.error().has_value()) {
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+        }
+        // Stable-sort by t, then collapse ties keeping the last (= latest
+        // input's value).
+        std::stable_sort(samples.begin(), samples.end(),
+                         [](const auto& a, const auto& b) {
+                             return a.first < b.first;
+                         });
+        std::vector<std::pair<std::int64_t, double>> deduped;
+        deduped.reserve(samples.size());
+        for (std::size_t i = 0; i < samples.size();) {
+            std::size_t j = i;
+            while (j + 1 < samples.size() &&
+                   samples[j + 1].first == samples[i].first) {
+                ++j;
+            }
+            deduped.push_back(samples[j]);
+            i = j + 1;
+        }
+
         SeriesInput si;
         si.labels = labels;
-        si.chunks = std::move(chunks);
+        if (!deduped.empty()) {
+            head::MemSeries ms(/*ref placeholder*/ 0, labels);
+            for (const auto& [t, v] : deduped) {
+                if (!ms.append(t, v)) {
+                    return std::unexpected(
+                        std::make_error_code(std::errc::io_error));
+                }
+            }
+            for (const auto* xc : ms.chunks()) {
+                if (xc->num_samples() == 0) continue;
+                ChunkInput ci;
+                ci.bytes.assign(xc->bytes().begin(), xc->bytes().end());
+                auto it = xc->iterator();
+                if (!it.next()) continue;
+                ci.min_time = it.t();
+                ci.max_time = it.t();
+                while (it.next()) ci.max_time = it.t();
+                si.chunks.push_back(std::move(ci));
+            }
+        }
         series_inputs.push_back(std::move(si));
     }
 

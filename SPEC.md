@@ -912,11 +912,12 @@ The end-to-end roundtrip test (`tests/block/block_writer_test.cpp::CrossValidati
 
 A compaction merges N ≥ 1 input blocks into a single output block. For each series present in any input:
 
-- All chunks across all inputs are collected.
-- Chunks are sorted by `min_time` ascending in the output.
-- The chunk bytes themselves are not re-encoded — they're written verbatim into the output's chunks segment files.
+- All chunks across all inputs are decoded into `(timestamp, value)` pairs.
+- The combined sample stream is stably sorted by timestamp ascending.
+- Duplicate timestamps are deduplicated **last-input-wins**: when two inputs cover the same `(series, timestamp)`, the value from the input later in the caller-supplied input order replaces earlier ones. Stable sort guarantees the dedup pass sees same-timestamp groups in input order; the implementation keeps the last element of each group.
+- The deduplicated stream is re-encoded into fresh XOR chunks using the same chunk-cutting policy as the head writer (soft byte cap + sample-count cap), so over-large concatenated runs are split naturally.
 
-For MVP, inputs are **assumed to have non-overlapping time ranges per series** (the standard "level promotion" use case). If two inputs cover the same `(series, timestamp)`, both chunks survive into the output; sample-level deduplication is a follow-up.
+This is **vertical merge with sample-level deduplication**. Non-overlapping inputs (the common "level promotion" case) pay the decode/re-encode cost but otherwise produce the same logical output as a verbatim concat would.
 
 ### §7.2 Level promotion
 
@@ -929,16 +930,17 @@ A level-1 input is a head-flush block (sources = `[self_ulid]`). Compacting two 
 
 ### §7.3 Procedure
 
-Same as §6.6, with the following modifications at step 5–6:
+Same as §6.6, with the following modifications:
 
-- Step 5: the symbol table, series, and postings are built by enumerating every series in every input block (deduplicated on canonical Labels).
-- Step 6: `compaction.level` and `compaction.sources` are computed per §7.2, not defaulted to 1 / [self_ulid].
+- Per series across all inputs: decode every chunk into `(t, v)` pairs, `std::stable_sort` by `t`, walk runs of equal `t` and keep the last entry (last-input-wins).
+- Re-encode the deduped sample stream through `MemSeries::append` so the writer's chunk-cutting policy applies uniformly. Each cut chunk's `min_time` / `max_time` are taken from the first / last successful iterator step over the produced bytes.
+- Step 5 of §6.6: the symbol table, series, and postings are built by enumerating every series in every input block (deduplicated on canonical Labels).
+- Step 6 of §6.6: `compaction.level` and `compaction.sources` are computed per §7.2, not defaulted to 1 / [self_ulid].
 
 ### §7.4 Out of scope
 
-- Sample-level deduplication for overlapping inputs (vertical-merge).
-- Re-chunking very large concatenated chunks (upstream splits them by sample count).
 - Block deletion / GC after successful compaction — caller is responsible.
+- Cross-series tombstones / range deletions — not yet modelled.
 
 ### §7.5 C++ reference
 
