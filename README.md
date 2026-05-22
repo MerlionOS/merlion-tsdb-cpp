@@ -2,29 +2,37 @@
 
 Modern C++23 reimplementation of the [Prometheus](https://github.com/prometheus/prometheus) TSDB storage engine.
 
-> **Status: pre-alpha** — chunk encoder shipped, WAL in progress. Live progress in [ROADMAP.md](ROADMAP.md).
+> **Status: alpha.** Read + write + compact + query paths all land bit-for-bit compatible with upstream v3.x format. 231 tests pass under Debug + ASan/UBSan. SPEC.md §1-§9 Final. Live progress in [ROADMAP.md](ROADMAP.md).
 
 ## Goals
 
 - **Wire-format compatible** with Prometheus v3.x blocks, WAL segments, and chunk files — drop-in for `/data` directories produced by upstream Go Prometheus. Binary layouts are pinned in [SPEC.md](SPEC.md), the shared specification with [`merlion-tsdb-rs`](https://github.com/MerlionOS/merlion-tsdb-rs).
-- **Modern C++23**: `std::expected`, `std::flat_map`, `std::print`, ranges, concepts. No legacy patterns.
-- **Tested against Go-produced golden vectors** at every layer (chunks → WAL → block index).
-- Eventually paired with a parallel Rust port ([`merlion-tsdb-rs`](https://github.com/MerlionOS/merlion-tsdb-rs)) for cross-implementation validation.
+- **Modern C++23**: `std::expected`, `std::span`, `std::filesystem`, `std::bit_cast`, ranges. No legacy patterns.
+- **Tested against Go-produced golden vectors** at every layer — the upstream `index_format_v1/` fixture (102 series) is read end-to-end on every CI run.
+- Paired with a parallel Rust port ([`merlion-tsdb-rs`](https://github.com/MerlionOS/merlion-tsdb-rs)) for cross-implementation validation. Both impls work from the same SPEC.md.
 
 ## Non-goals (for now)
 
 - PromQL engine, scrape loop, service discovery, remote write/read, Web UI — these live in upstream Prometheus and may be ported later as separate projects.
 
-## Scope (initial)
+## Status
 
 | Component | Upstream Go | Status |
 |---|---|---|
-| Chunk encoding (XOR/Gorilla, histograms) | `tsdb/chunkenc/` | planned |
-| WAL reader/writer | `tsdb/wlog/` | planned |
-| Head block (in-memory) | `tsdb/head.go` | planned |
-| Persistent block + index v3 | `tsdb/block.go`, `tsdb/index/` | planned |
-| Compactor | `tsdb/compact.go` | planned |
-| Tombstones | `tsdb/tombstones/` | planned |
+| Encoding primitives (varint, bstream, CRC32C) | `tsdb/encoding/`, `model/textparse/` | ✅ Final |
+| XOR/Gorilla chunk encoder | `tsdb/chunkenc/xor.go` | ✅ Final |
+| WAL reader/writer | `tsdb/wlog/` | ✅ Final |
+| Head block (in-memory + WAL replay) | `tsdb/head.go` | ✅ Final |
+| Persistent block reader | `tsdb/block.go`, `tsdb/index/` | ✅ Final (V1/V2/V3 read) |
+| Persistent block writer + ULID | `tsdb/block.go`, `oklog/ulid` | ✅ Final (V2 write) |
+| Compactor (vertical-merge dedup) | `tsdb/compact.go` | ✅ Final |
+| Matchers + block querier | `pkg/labels`, `tsdb.BlockQuerier` | ✅ Final |
+| Cross-block querier | `storage.MergeSeriesSet` | ✅ Final |
+| Head querier (in-memory `select`) | `tsdb.HeadQuerier` | ⬜ Next (§10) |
+| Histogram chunks (integer + float) | `tsdb/chunkenc/histogram*.go` | ⬜ |
+| Tombstones (read path) | `tsdb/tombstones/` | 🟡 (MVP writes empty) |
+
+End-to-end proven: write 20 series → flush head → block → index → query through `Block::select` → decode → recover bit-identical samples. See `tests/block/block_writer_test.cpp::CrossValidationAggregateQueryRecoversAllSeries`.
 
 ## Build
 
@@ -46,17 +54,41 @@ CLion: open the project directory; it auto-detects `CMakePresets.json`.
 
 ```
 src/
-  chunkenc/   XOR / Gorilla / histogram encoders
-  wal/        Write-ahead log
-  head/       In-memory head block
-  block/      Persistent block reader/writer
-  encoding/   Varint, CRC32, bit-stream primitives
-include/merlion_tsdb/   Public headers
-tests/        GoogleTest unit tests
-bench/        Google Benchmark microbenchmarks (planned)
+  encoding/     varint, CRC32C, bit-stream primitives
+  chunkenc/     XOR / Gorilla encoder
+  wal/          Write-ahead log (segments, records, pages)
+  model/        Labels, Matcher
+  head/         In-memory head block + WAL replay
+  block/        Persistent block reader/writer (meta, chunks, index, ulid)
+  querier/      Cross-block querier
+include/merlion_tsdb/   Public headers (mirror of src/)
+tests/        GoogleTest unit tests (~231 cases)
 testdata/     Golden fixtures (Go-produced for binary parity)
 cmake/        Toolchain + helpers
+SPEC.md       The on-disk format spec (§1-§9 Final)
+ROADMAP.md    Subsystem-by-subsystem status
 ```
+
+## Using as a library
+
+The current surface is C++ headers under `merlion_tsdb::`. The key entry points:
+
+```cpp
+// Open and query an existing block.
+auto blk = merlion_tsdb::block::Block::open("data/01HX.../");
+std::array ms{
+    merlion_tsdb::model::Matcher::equal("__name__", "up"),
+    merlion_tsdb::model::Matcher::equal("job", "api"),
+};
+auto results = blk->select(ms, /*mint=*/0, /*maxt=*/INT64_MAX);
+
+// Or span multiple blocks.
+std::vector<const merlion_tsdb::block::Block*> blocks = /* ... */;
+merlion_tsdb::querier::Querier q{blocks};
+auto merged = q.select(ms, mint, maxt);
+```
+
+`MergedSeries::chunks[i].iterator()` walks samples for each XOR chunk in `min_time` order. Sample-level overlap pruning is the caller's job (consistent with upstream's chunk-handoff contract — see SPEC §8.1).
 
 ## License
 
