@@ -61,6 +61,7 @@ add_library(merlion_tsdb_core STATIC
     src/block/chunks.cpp
     src/block/index.cpp
     src/block/block.cpp
+    src/block/index_writer.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(merlion_tsdb_core PRIVATE nlohmann_json::nlohmann_json)
