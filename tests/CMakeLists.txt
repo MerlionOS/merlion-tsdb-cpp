@@ -12,6 +12,7 @@ add_executable(merlion_tsdb_tests
     head/mem_series_test.cpp
     head/series_store_test.cpp
     head/head_test.cpp
+    head/head_replay_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
