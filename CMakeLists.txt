@@ -44,6 +44,8 @@ add_library(merlion_tsdb_core STATIC
     src/wal/segment_reader.cpp
     src/wal/record.cpp
     src/model/labels.cpp
+    src/head/mem_series.cpp
+    src/head/series_store.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 

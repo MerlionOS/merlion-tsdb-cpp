@@ -9,6 +9,8 @@ add_executable(merlion_tsdb_tests
     wal/segment_reader_test.cpp
     wal/record_test.cpp
     model/labels_test.cpp
+    head/mem_series_test.cpp
+    head/series_store_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
