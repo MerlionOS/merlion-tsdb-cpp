@@ -2,7 +2,7 @@
 
 Modern C++23 reimplementation of the [Prometheus](https://github.com/prometheus/prometheus) TSDB storage engine.
 
-> **Status: pre-alpha.** Toolchain bootstrapped, no functional code yet. First milestone is byte-compatible chunk encoding.
+> **Status: pre-alpha** — chunk encoder shipped, WAL in progress. Live progress in [ROADMAP.md](ROADMAP.md).
 
 ## Goals
 
