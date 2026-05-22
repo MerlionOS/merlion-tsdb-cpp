@@ -71,11 +71,13 @@ TEST(ChunkRef, PackingRoundtrips) {
     EXPECT_EQ(back, r);
 }
 
-TEST(ChunkWriter, SegmentStartsAtOne) {
+TEST(ChunkWriter, FirstSegmentIsSeqZeroNamed000001) {
     TempDir tmp;
     auto w = *b::ChunkWriter::open(tmp.path() / "chunks");
-    EXPECT_EQ(w.current_seq(), 1u);
-    EXPECT_TRUE(std::filesystem::exists(tmp.path() / "chunks" / "000001"));
+    EXPECT_EQ(w.current_seq(), 0u)
+        << "seq is the 0-indexed array position (upstream's BlockChunkRef convention)";
+    EXPECT_TRUE(std::filesystem::exists(tmp.path() / "chunks" / "000001"))
+        << "filename is `(seq + 1)` zero-padded to 6 digits (upstream's segmentFile)";
 }
 
 TEST(ChunkWriter, HeaderHasCorrectMagicAndVersion) {
@@ -104,7 +106,7 @@ TEST(ChunkRoundtrip, SingleChunkWriteThenRead) {
     auto w = *b::ChunkWriter::open(tmp.path() / "chunks");
     auto ref = w.write(c::Encoding::XOR, data);
     ASSERT_TRUE(ref.has_value());
-    EXPECT_EQ(ref->seq, 1u);
+    EXPECT_EQ(ref->seq, 0u);
     EXPECT_EQ(ref->offset, b::k_chunks_segment_header_size);
     ASSERT_TRUE(w.close().has_value());
 
@@ -144,17 +146,17 @@ TEST(ChunkRoundtrip, ManyChunksAcrossSegmentBoundary) {
     }
 }
 
-TEST(ChunkReader, ResumesAtNextSeqAfterExistingFiles) {
+TEST(ChunkWriter, RefusesNonEmptyChunksDirectory) {
+    // Blocks are atomic: their chunks/ is written fresh per block. If the
+    // dir already has a numbered segment file, refuse to open. Matches
+    // upstream — there's no in-place append-to-existing-block flow.
     TempDir tmp;
-    // Pre-create a placeholder file at seq=5.
     std::filesystem::create_directories(tmp.path() / "chunks");
-    {
-        std::ofstream(tmp.path() / "chunks" / "000005") << "ignored";
-    }
-    // Writer should resume at 6.
-    auto w = *b::ChunkWriter::open(tmp.path() / "chunks");
-    EXPECT_EQ(w.current_seq(), 6u);
-    EXPECT_TRUE(std::filesystem::exists(tmp.path() / "chunks" / "000006"));
+    std::ofstream(tmp.path() / "chunks" / "000001") << "preexisting";
+
+    auto w = b::ChunkWriter::open(tmp.path() / "chunks");
+    EXPECT_FALSE(w.has_value());
+    EXPECT_EQ(w.error(), std::make_error_code(std::errc::file_exists));
 }
 
 TEST(ChunkReader, CrcCorruptionIsDetected) {
@@ -193,7 +195,7 @@ TEST(ChunkReader, IterateRecoversAllChunks) {
     ASSERT_TRUE(w.close().has_value());
 
     auto rdr = *b::ChunkReader::open(tmp.path() / "chunks");
-    auto infos = rdr.iterate_segment(1);
+    auto infos = rdr.iterate_segment(0);  // 0-indexed array position
     ASSERT_TRUE(infos.has_value());
     EXPECT_EQ(infos->size(), 7u);
     for (std::size_t i = 0; i < infos->size(); ++i) {
@@ -207,7 +209,7 @@ TEST(ChunkReader, ReadsUpstreamGoldenChunksFile) {
     EXPECT_EQ(rdr.segment_count(), 1u);
     auto seqs = rdr.segment_seqs();
     ASSERT_EQ(seqs.size(), 1u);
-    EXPECT_EQ(seqs[0], 1u);
+    EXPECT_EQ(seqs[0], 0u);  // 0-indexed array position; filename is 000001
     auto infos = rdr.iterate_segment(seqs[0]);
     ASSERT_TRUE(infos.has_value());
     // Golden block has 102 chunks per its meta.json.
