@@ -6,7 +6,7 @@ Modern C++23 reimplementation of the [Prometheus](https://github.com/prometheus/
 
 ## Goals
 
-- **Wire-format compatible** with Prometheus v3.x blocks, WAL segments, and chunk files — drop-in for `/data` directories produced by upstream Go Prometheus.
+- **Wire-format compatible** with Prometheus v3.x blocks, WAL segments, and chunk files — drop-in for `/data` directories produced by upstream Go Prometheus. Binary layouts are pinned in [SPEC.md](SPEC.md), the shared specification with [`merlion-tsdb-rs`](https://github.com/MerlionOS/merlion-tsdb-rs).
 - **Modern C++23**: `std::expected`, `std::flat_map`, `std::print`, ranges, concepts. No legacy patterns.
 - **Tested against Go-produced golden vectors** at every layer (chunks → WAL → block index).
 - Eventually paired with a parallel Rust port ([`merlion-tsdb-rs`](https://github.com/MerlionOS/merlion-tsdb-rs)) for cross-implementation validation.
