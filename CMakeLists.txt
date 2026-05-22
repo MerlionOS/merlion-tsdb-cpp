@@ -34,7 +34,14 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+add_library(merlion_tsdb_core STATIC
+    src/encoding/bstream.cpp
+    src/encoding/varint.cpp
+)
+target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
+
 add_executable(merlion_tsdb_smoke src/smoke.cpp)
+target_link_libraries(merlion_tsdb_smoke PRIVATE merlion_tsdb_core)
 
 if(MERLION_TSDB_BUILD_TESTS)
     enable_testing()
