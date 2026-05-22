@@ -30,10 +30,12 @@ namespace merlion_tsdb::head {
 class Head {
 public:
     // Opens (or creates) a head block rooted at `dir`. Creates the
-    // directory and its `wal/` subdirectory if needed. The segment
-    // writer resumes at the next free index, so a process restart picks
-    // up where it left off — but the series map will be empty until
-    // phase 4 lands replay.
+    // directory and its `wal/` subdirectory if needed. If existing
+    // segments are found under `dir/wal/`, they are replayed first to
+    // reconstruct the in-memory series + sample state, then the segment
+    // writer opens at the next free index for new writes. A torn record
+    // at the tail of the last segment is dropped silently — same
+    // behaviour as Go's WAL replay.
     [[nodiscard]] static std::expected<Head, std::error_code>
     open(const std::filesystem::path& dir);
 

@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "merlion_tsdb/wal/segment_reader.hpp"
+
 namespace merlion_tsdb::head {
 
 namespace {
@@ -15,6 +17,75 @@ std::vector<wal::record::Label> to_wal_labels(const model::Labels& l) {
         out.push_back({.name = e.name, .value = e.value});
     }
     return out;
+}
+
+// Reverse direction: wal::record::Label vector → model::Labels (canonical).
+model::Labels to_model_labels(const std::vector<wal::record::Label>& src) {
+    std::vector<model::Label> entries;
+    entries.reserve(src.size());
+    for (const auto& l : src) entries.push_back({l.name, l.value});
+    return model::Labels{std::move(entries)};
+}
+
+// Walk every record in `wal_dir`, reconstructing the in-memory series map
+// and re-appending samples to MemSeries chunks. A non-existent directory
+// is treated as a fresh head (no replay needed). A torn record at the
+// tail of the last segment is dropped silently (matches Go semantics);
+// any other read error is fatal.
+std::expected<void, std::error_code>
+replay_wal_into(const std::filesystem::path& wal_dir, SeriesStore& store) {
+    auto rdr_or = wal::SegmentReader::open(wal_dir);
+    if (!rdr_or) {
+        const auto& ec = rdr_or.error();
+        // Empty / missing wal directory means nothing to replay.
+        if (ec == std::make_error_code(std::errc::no_such_file_or_directory) ||
+            ec == std::make_error_code(std::errc::not_a_directory)) {
+            return {};
+        }
+        return std::unexpected(ec);
+    }
+    auto& rdr = *rdr_or;
+
+    while (true) {
+        auto rec = rdr.next();
+        if (!rec) {
+            if (rec.error() == wal::SegmentReadError::EndOfStream) return {};
+            return std::unexpected(std::make_error_code(std::errc::io_error));
+        }
+
+        const auto type = wal::record::peek_type(*rec);
+        if (type == wal::record::Type::Series) {
+            auto decoded = wal::record::decode_series(*rec);
+            if (!decoded) {
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+            for (const auto& s : *decoded) {
+                if (!store.insert_with_ref(s.ref, to_model_labels(s.labels))) {
+                    return std::unexpected(std::make_error_code(std::errc::io_error));
+                }
+            }
+        } else if (type == wal::record::Type::SamplesV2) {
+            auto decoded = wal::record::decode_samples_v2(*rec);
+            if (!decoded) {
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+            for (const auto& s : *decoded) {
+                auto* series = store.get(s.ref);
+                if (!series) {
+                    // Sample referencing an unknown series. Either the WAL
+                    // is corrupt or it was written by a version that
+                    // omitted the matching Series record. Bail.
+                    return std::unexpected(std::make_error_code(std::errc::io_error));
+                }
+                if (!series->append(s.t, s.v)) {
+                    return std::unexpected(std::make_error_code(std::errc::io_error));
+                }
+            }
+        }
+        // Other record types (Samples V1, Tombstones, Exemplars,
+        // histograms, …) aren't emitted by this Head yet; silently skip
+        // them for forward compatibility against future writers.
+    }
 }
 
 }  // namespace
@@ -62,10 +133,21 @@ Head::open(const std::filesystem::path& dir) {
     std::filesystem::create_directories(dir, ec);
     if (ec) return std::unexpected(ec);
 
+    // Replay existing WAL first, BEFORE opening the segment writer (which
+    // would otherwise create a new empty segment and inflate the replay
+    // path with a no-op file). After replay, the writer opens at the next
+    // free index for fresh appends.
+    SeriesStore store;
+    if (auto r = replay_wal_into(dir / "wal", store); !r) {
+        return std::unexpected(r.error());
+    }
+
     auto wal = wal::SegmentWriter::open(dir / "wal");
     if (!wal) return std::unexpected(wal.error());
 
-    return Head{dir, std::move(*wal)};
+    Head h{dir, std::move(*wal)};
+    h.series_ = std::move(store);
+    return h;
 }
 
 std::expected<SeriesRef, std::error_code>
