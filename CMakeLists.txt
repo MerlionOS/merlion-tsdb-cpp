@@ -34,6 +34,16 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 add_library(merlion_tsdb_core STATIC
     src/encoding/bstream.cpp
     src/encoding/varint.cpp
@@ -47,8 +57,10 @@ add_library(merlion_tsdb_core STATIC
     src/head/mem_series.cpp
     src/head/series_store.cpp
     src/head/head.cpp
+    src/block/meta.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(merlion_tsdb_core PRIVATE nlohmann_json::nlohmann_json)
 
 add_executable(merlion_tsdb_smoke src/smoke.cpp)
 target_link_libraries(merlion_tsdb_smoke PRIVATE merlion_tsdb_core)
