@@ -7,6 +7,7 @@ add_executable(merlion_tsdb_tests
     wal/page_test.cpp
     wal/segment_writer_test.cpp
     wal/segment_reader_test.cpp
+    wal/record_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
