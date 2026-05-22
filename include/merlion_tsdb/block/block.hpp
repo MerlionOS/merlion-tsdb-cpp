@@ -15,6 +15,8 @@
 #include "merlion_tsdb/chunkenc/xor.hpp"
 #include "merlion_tsdb/model/labels.hpp"
 
+namespace merlion_tsdb::head { class Head; }
+
 // Persistent-block reader — composes meta.json + index + chunks/ into one
 // queryable handle.
 //
@@ -95,6 +97,19 @@ public:
     [[nodiscard]] static std::expected<std::filesystem::path, std::error_code>
     create_from_series(const std::filesystem::path& parent_dir,
                        std::span<const SeriesInput> series);
+
+    // Thin adapter on top of create_from_series: walks every MemSeries
+    // in `head`'s SeriesStore, extracts each chunk's bytes + computes
+    // its (min_t, max_t) by iterating, and flushes a new block under
+    // `parent_dir`. The Head itself isn't modified — this is a
+    // read-only snapshot of in-memory state. Pending WAL records are
+    // independent and unaffected.
+    //
+    // Forward-declared `head::Head` to avoid pulling head.hpp into this
+    // header; the implementation lives in block.cpp.
+    [[nodiscard]] static std::expected<std::filesystem::path, std::error_code>
+    create_from_head(const std::filesystem::path& parent_dir,
+                     const head::Head& head);
 
 private:
     Block(std::filesystem::path dir,

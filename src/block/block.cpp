@@ -10,6 +10,9 @@
 
 #include "merlion_tsdb/block/index_writer.hpp"
 #include "merlion_tsdb/block/ulid.hpp"
+#include "merlion_tsdb/head/head.hpp"
+#include "merlion_tsdb/head/mem_series.hpp"
+#include "merlion_tsdb/head/series_store.hpp"
 
 namespace merlion_tsdb::block {
 
@@ -200,6 +203,52 @@ Block::create_from_series(const std::filesystem::path& parent_dir,
     }
 
     return block_dir;
+}
+
+std::expected<std::filesystem::path, std::error_code>
+Block::create_from_head(const std::filesystem::path& parent_dir,
+                        const head::Head& head) {
+    std::vector<SeriesInput> inputs;
+    inputs.reserve(head.series().size());
+
+    for (const auto* memseries : head.series().all_series()) {
+        if (memseries->num_samples() == 0) continue;
+
+        SeriesInput si;
+        si.labels = memseries->labels();
+        si.chunks.reserve(memseries->num_chunks());
+
+        for (const auto* xc : memseries->chunks()) {
+            if (xc->num_samples() == 0) continue;
+            ChunkInput ci;
+            ci.bytes.assign(xc->bytes().begin(), xc->bytes().end());
+
+            // Walk the chunk once to recover min_time and max_time.
+            // The XOR encoder emits samples in monotonic timestamp
+            // order, so the first sample is the min and the last is
+            // the max — we can capture them in one pass without
+            // tracking running aggregates.
+            auto it = xc->iterator();
+            if (!it.next()) {
+                // Chunk reported num_samples > 0 but iterator yielded
+                // nothing. That's a structural mismatch — surface it
+                // rather than fabricating bogus times.
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+            ci.min_time = it.t();
+            ci.max_time = it.t();
+            while (it.next()) ci.max_time = it.t();
+            if (it.error().has_value()) {
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+            si.chunks.push_back(std::move(ci));
+        }
+
+        if (si.chunks.empty()) continue;
+        inputs.push_back(std::move(si));
+    }
+
+    return create_from_series(parent_dir, inputs);
 }
 
 std::expected<std::vector<Block::QueryResult>, std::error_code>
