@@ -105,22 +105,20 @@ ChunkWriter::open(const std::filesystem::path& dir, std::size_t segment_size) {
     std::filesystem::create_directories(dir, ec);
     if (ec) return std::unexpected(ec);
 
-    // Resume at max(existing) + 1; if directory is empty, start at 1.
-    std::uint32_t next_seq = 1;
-    bool any_found = false;
+    // Each block writes a fresh chunks/ directory; resume-after-crash is
+    // unnecessary for block writes (the whole block is rewritten on
+    // compaction failure). Match upstream's writer: refuse non-empty dirs.
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) return std::unexpected(ec);
         if (!entry.is_regular_file()) continue;
-        auto parsed = parse_segment_name(entry.path().filename().string());
-        if (!parsed) continue;
-        any_found = true;
-        next_seq = std::max(next_seq, *parsed + 1U);
+        if (parse_segment_name(entry.path().filename().string())) {
+            return std::unexpected(std::make_error_code(std::errc::file_exists));
+        }
     }
-    if (!any_found) next_seq = 1;
     if (ec) return std::unexpected(ec);
 
     ChunkWriter w(dir, segment_size);
-    w.seq_ = next_seq;
+    w.seq_ = 0;  // 0-indexed array position; matches upstream's BlockChunkRef.
     if (auto r = w.cut_new_segment(); !r) return std::unexpected(r.error());
     return w;
 }
@@ -132,7 +130,9 @@ std::expected<void, std::error_code> ChunkWriter::cut_new_segment() {
         fd_ = -1;
         ++seq_;
     }
-    const auto path = dir_ / format_segment_name(seq_);
+    // Filename is (seq + 1) zero-padded to 6 digits — upstream convention.
+    // The ChunkRef's `seq` field is the 0-indexed value `seq_`.
+    const auto path = dir_ / format_segment_name(seq_ + 1U);
     fd_ = ::open(path.c_str(),
                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
                  S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -226,23 +226,30 @@ ChunkReader::open(const std::filesystem::path& dir) {
         return std::unexpected(std::make_error_code(std::errc::not_a_directory));
     }
 
-    std::vector<std::pair<std::uint32_t, std::filesystem::path>> segs;
+    // Collect path-and-filename-id pairs, sort by filename id ascending, then
+    // RE-INDEX so the public-facing `seq` is the 0-indexed array position.
+    // This matches upstream's BlockChunkRef.Unpack (chunks/chunks.go:113) —
+    // the unpacked seq is `bs[seq]` in the segment slice array, not the
+    // numeric filename.
+    std::vector<std::pair<std::uint32_t, std::filesystem::path>> raw;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) return std::unexpected(ec);
         if (!entry.is_regular_file()) continue;
         auto parsed = parse_segment_name(entry.path().filename().string());
         if (!parsed) continue;
-        segs.emplace_back(*parsed, entry.path());
+        raw.emplace_back(*parsed, entry.path());
     }
-    std::sort(segs.begin(), segs.end(),
+    std::sort(raw.begin(), raw.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    ChunkReader r(std::move(segs));
-    // Resize the cache to span every seq. Slots stay empty until first use.
-    if (!r.segments_.empty()) {
-        const auto max_seq = r.segments_.back().first;
-        r.segment_bytes_cache_.resize(max_seq + 1U);
+    std::vector<std::pair<std::uint32_t, std::filesystem::path>> segs;
+    segs.reserve(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        segs.emplace_back(static_cast<std::uint32_t>(i), std::move(raw[i].second));
     }
+
+    ChunkReader r(std::move(segs));
+    r.segment_bytes_cache_.resize(r.segments_.size());
     return r;
 }
 
@@ -262,13 +269,9 @@ ChunkReader::bytes_for(std::uint32_t seq) const {
     if (!cached.empty()) {
         return std::span<const std::uint8_t>{cached};
     }
-    // Locate the path for this seq.
-    auto it = std::find_if(segments_.begin(), segments_.end(),
-                           [seq](const auto& p) { return p.first == seq; });
-    if (it == segments_.end()) {
-        return std::unexpected(std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    std::ifstream in(it->second, std::ios::binary);
+    // Direct 0-indexed lookup — segments_ is dense from 0..size()-1 after
+    // open() re-indexed.
+    std::ifstream in(segments_[seq].second, std::ios::binary);
     if (!in) return std::unexpected(errno_ec());
     cached.assign(std::istreambuf_iterator<char>(in),
                   std::istreambuf_iterator<char>{});

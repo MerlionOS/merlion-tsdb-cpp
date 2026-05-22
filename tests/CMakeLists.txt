@@ -18,6 +18,7 @@ add_executable(merlion_tsdb_tests
     block/index_test.cpp
     block/postings_test.cpp
     block/series_test.cpp
+    block/block_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
