@@ -14,6 +14,7 @@
 #include "merlion_tsdb/block/meta.hpp"
 #include "merlion_tsdb/chunkenc/xor.hpp"
 #include "merlion_tsdb/model/labels.hpp"
+#include "merlion_tsdb/model/matcher.hpp"
 
 namespace merlion_tsdb::head { class Head; }
 
@@ -63,6 +64,25 @@ public:
     // (NOT an error) if no series matches.
     [[nodiscard]] std::expected<std::vector<QueryResult>, std::error_code>
     query(std::string_view name, std::string_view value) const;
+
+    // §8 Querier surface. Matches every series whose labels satisfy ALL
+    // matchers (logical AND) and intersects with the half-open time
+    // range [mint, maxt]. Chunks that don't overlap the time range are
+    // dropped; surviving chunks are decoded as XORChunks.
+    //
+    // `matchers` must contain at least one matcher — upstream Prometheus
+    // forbids empty matcher sets to avoid accidentally selecting the
+    // entire block. Returns an empty vector (NOT an error) if no series
+    // satisfies the matchers.
+    //
+    // Time-range semantics match upstream: a chunk with [chunk.mint,
+    // chunk.maxt] overlaps a query range [mint, maxt] when
+    // chunk.mint <= maxt && chunk.maxt >= mint. Overlapping chunks are
+    // returned in full — sample-level pruning is the caller's job.
+    [[nodiscard]] std::expected<std::vector<QueryResult>, std::error_code>
+    select(std::span<const model::Matcher> matchers,
+           std::int64_t mint,
+           std::int64_t maxt) const;
 
     // ---- Block creation API (head → block flush) -----------------------
 

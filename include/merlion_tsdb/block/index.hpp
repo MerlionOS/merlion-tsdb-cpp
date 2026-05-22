@@ -195,6 +195,26 @@ public:
     [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
     postings(std::string_view name, std::string_view value) const;
 
+    // Sorted, deduped union of every posting list whose label name is
+    // `name`. Equivalent to `Σ postings(name, v) for each v under name`.
+    // Returns empty if `name` has no posting lists at all (i.e. the
+    // label is absent from every series).
+    [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
+    postings_for_name(std::string_view name) const;
+
+    // Sorted, deduped union of every posting list in the block — every
+    // series id that appears anywhere. Used by Neq/Nre/regex-matches-
+    // empty matchers to compute the complement. Built by walking the
+    // postings offset table once.
+    [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
+    all_postings() const;
+
+    // Every distinct label value with a non-empty posting list under
+    // `name`. Lexicographically sorted. Used by Re/Nre matchers to
+    // expand a regex into the matching subset of posting lists.
+    [[nodiscard]] std::vector<std::string>
+    label_values(std::string_view name) const;
+
     // Decode one series entry by its ID (as written in posting lists).
     // V1: id is the absolute file offset of the entry's length prefix.
     // V2/V3: id is the byte offset divided by 16 (series entries are

@@ -949,6 +949,84 @@ Same as §6.6, with the following modifications:
 
 ---
 
+## §8. Querier ✅
+
+### §8.1 Surface
+
+A block-level querier selects series matching a conjunction of label matchers and a half-open time range, then returns each surviving series's labels plus the chunks that overlap the range.
+
+```
+Block::select(matchers, mint, maxt) -> [{labels, chunks, chunk_metas}]
+```
+
+- `matchers` is non-empty; an empty matcher set is rejected (upstream forbids it to avoid accidentally scanning the entire block).
+- All matchers are AND'd. There is no in-block OR — repeated calls with different matcher sets are the caller's responsibility, as is union/merge across blocks.
+- `[mint, maxt]` is inclusive on both ends. A chunk with `[c.mint, c.maxt]` is kept iff `c.mint <= maxt && c.maxt >= mint`. Sample-level pruning inside a kept chunk is the caller's job — the querier hands back the entire `XORChunk` for any chunk that overlaps the range.
+
+### §8.2 Matcher types
+
+Mirror `labels.Matcher` upstream:
+
+| Type | Semantics |
+|------|-----------|
+| `Eq(N, v)`  | series.labels[N] == v |
+| `Neq(N, v)` | series.labels[N] != v |
+| `Re(N, p)`  | regex(`^(p)$`) matches series.labels[N] |
+| `Nre(N, p)` | regex(`^(p)$`) does NOT match series.labels[N] |
+
+**Anchoring.** Re/Nre patterns are wrapped in `^(p)$` at compile time. Callers do not need to pre-anchor; partial-match semantics are not supported (matches upstream PromQL).
+
+**Empty-value semantics.** A series without label `N` is treated as having `N=""`:
+
+- `Eq(N, "")` → series WITHOUT `N` (and series with `N=""` if any — we never emit empty-value postings, so this collapses to "series without `N`").
+- `Neq(N, "")` → series WITH `N` (non-empty value).
+- `Re(N, p)` where `p` matches `""` → also include series without `N`.
+- `Nre(N, p)` where `p` does NOT match `""` → also include series without `N`.
+
+These rules let `Neq("job", "web")` correctly include both `job=api` series and series with no `job` label, mirroring PromQL.
+
+### §8.3 Algorithm
+
+Per matcher, resolve a posting list:
+
+- `Eq(N, v≠"")`: direct lookup `idx.postings(N, v)`.
+- `Eq(N, "")`: `all_postings() − postings_for_name(N)`.
+- `Neq(N, v≠"")`: `all_postings() − postings(N, v)`.
+- `Neq(N, "")`: `postings_for_name(N)`.
+- `Re(N, p)`: union of `postings(N, v)` for every `v ∈ label_values(N)` with `regex_match(v)`. If `regex_match("")`, also union the "series without N" set.
+- `Nre(N, p)`: `all_postings() − Re(N, p)`. The Re side is computed via the underlying regex (not the inverted matcher), since `Matcher::matches()` already inverts polarity for Nre.
+
+Posting lists are kept sorted-unique throughout. Per-matcher resolution outputs are intersected pairwise (`std::set_intersection`) to yield the final series id set.
+
+Each surviving series is decoded once via `IndexReader::series(id)`. Its chunks are walked; those that overlap `[mint, maxt]` per §8.1 are loaded via `ChunkReader::read` and decoded as `XORChunk`. A series whose every chunk falls outside the range is dropped from the result entirely.
+
+### §8.4 Index reader helpers
+
+To support the matcher rewrites, `IndexReader` exposes:
+
+- `all_postings()` — sorted-deduped union of every posting list. (We do not emit an upstream-style `("", "")` sentinel posting; the union is computed on demand.)
+- `postings_for_name(name)` — sorted-deduped union of every posting list whose label name is `name`.
+- `label_values(name)` — every distinct value with a posting list under `name`, lex-sorted.
+
+These walk the postings offset table once; cost scales with the number of distinct `(name, value)` pairs.
+
+### §8.5 Out of scope
+
+- Sample-level pruning inside returned chunks (caller iterates).
+- Cross-block merging — upstream's `Querier`/`SeriesSet` joining lives one layer up.
+- Tombstone application — chunks are returned even if a tombstone would drop their samples. Tombstone reads are deferred per §6.8.
+- Concurrent reader refcounting / snapshot stability.
+
+### §8.6 C++ reference
+
+- `merlion-tsdb-cpp/include/merlion_tsdb/model/matcher.hpp` — matcher type
+- `merlion-tsdb-cpp/src/model/matcher.cpp` — regex compile + value test
+- `merlion-tsdb-cpp/src/block/block.cpp::Block::select` — implementation
+- `merlion-tsdb-cpp/src/block/index.cpp::IndexReader::{all_postings,postings_for_name,label_values}` — supporting helpers
+- `merlion-tsdb-cpp/tests/block/select_test.cpp` — 13 tests covering AND, Eq/Neq, Re/Nre, empty-value semantics, anchored regex, time-range pruning
+
+---
+
 ## Appendix A. Pitfalls catalogue
 
 Real bugs encountered or anticipated during porting. Each line is a "do not repeat":
@@ -991,3 +1069,4 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 - **2026-05-22** — Initial draft. §1, §2, §3.1 in detail; §3.2–§7 are skeletons pending implementation.
 - **2026-05-22** — §3.1 promoted from Drafted to Final. C++ implementation landed in `merlion-tsdb-cpp` with 12 passing tests (Debug + ASan/UBSan).
 - **2026-05-22** — §4 WAL, §5 Head, §6 Persistent block all promoted to Final. New §7 Compaction added (level promotion + source aggregation). Old §7 Tombstones folded into §6.8 (still deferred for read; MVP writes empty). Pitfalls catalogue extended to 19 items, capturing every wire-format gotcha that surfaced during the C++ port. `merlion-tsdb-cpp` carries the reference implementation with 206 passing tests (Debug + ASan/UBSan), including end-to-end roundtrip: append → Head → WAL → flush → block → query → decode → bit-level parity.
+- **2026-05-23** — §7 promoted to vertical-merge with sample-level dedup (last-input-wins); previous "verbatim concat" wording removed. §8 Querier added (matchers + time-range filter + posting-list intersect). `merlion-tsdb-cpp` carries 222 passing tests (Debug + ASan/UBSan).

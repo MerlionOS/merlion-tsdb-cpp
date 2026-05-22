@@ -391,6 +391,176 @@ Block::create_from_head(const std::filesystem::path& parent_dir,
     return create_from_series(parent_dir, inputs);
 }
 
+namespace {
+
+// Sorted intersection of two ascending-unique vectors. Output is the
+// values present in both inputs, ascending and unique.
+std::vector<std::uint32_t>
+sorted_intersection(const std::vector<std::uint32_t>& a,
+                    const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> out;
+    out.reserve(std::min(a.size(), b.size()));
+    std::set_intersection(a.begin(), a.end(),
+                          b.begin(), b.end(),
+                          std::back_inserter(out));
+    return out;
+}
+
+// Sorted difference a \ b. Both inputs must be ascending-unique.
+std::vector<std::uint32_t>
+sorted_difference(const std::vector<std::uint32_t>& a,
+                  const std::vector<std::uint32_t>& b) {
+    std::vector<std::uint32_t> out;
+    out.reserve(a.size());
+    std::set_difference(a.begin(), a.end(),
+                        b.begin(), b.end(),
+                        std::back_inserter(out));
+    return out;
+}
+
+// Resolve one matcher into its set of matching series ids. Empty-value
+// semantics follow Prometheus: a series without label N is treated as
+// having N="". For Re/Nre, the matcher's compiled regex is consulted
+// per candidate value (Re) or to compute the complement (Nre).
+std::expected<std::vector<std::uint32_t>, std::error_code>
+postings_for_matcher(const IndexReader& idx, const model::Matcher& m) {
+    using model::MatchType;
+    switch (m.type()) {
+        case MatchType::Eq: {
+            if (m.value().empty()) {
+                // Series WITHOUT this label (or with empty value, but we
+                // never emit empty-value postings).
+                auto all = idx.all_postings();
+                if (!all) return std::unexpected(all.error());
+                auto with = idx.postings_for_name(m.name());
+                if (!with) return std::unexpected(with.error());
+                return sorted_difference(*all, *with);
+            }
+            return idx.postings(m.name(), m.value());
+        }
+        case MatchType::Neq: {
+            if (m.value().empty()) {
+                // Series WITH this label (any non-empty value).
+                return idx.postings_for_name(m.name());
+            }
+            auto all = idx.all_postings();
+            if (!all) return std::unexpected(all.error());
+            auto eq  = idx.postings(m.name(), m.value());
+            if (!eq) return std::unexpected(eq.error());
+            return sorted_difference(*all, *eq);
+        }
+        case MatchType::Re: {
+            std::vector<std::uint32_t> out;
+            bool empty_matches = m.matches("");
+            // Union every (name, value) whose value matches the regex.
+            for (const auto& v : idx.label_values(m.name())) {
+                if (!m.matches(v)) continue;
+                auto ids = idx.postings(m.name(), v);
+                if (!ids) return std::unexpected(ids.error());
+                out.insert(out.end(), ids->begin(), ids->end());
+            }
+            if (empty_matches) {
+                // Include series without this label (treated as N="").
+                auto all = idx.all_postings();
+                if (!all) return std::unexpected(all.error());
+                auto with = idx.postings_for_name(m.name());
+                if (!with) return std::unexpected(with.error());
+                auto without = sorted_difference(*all, *with);
+                out.insert(out.end(), without.begin(), without.end());
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
+        }
+        case MatchType::Nre: {
+            // Compute the set of series the regex DOES match, then
+            // subtract from all_postings. Note m.matches() for Nre is
+            // already inverted, so we use regex_matches() here to query
+            // the underlying pattern.
+            std::vector<std::uint32_t> matching;
+            const bool empty_matches_regex = m.regex_matches("");
+            for (const auto& v : idx.label_values(m.name())) {
+                if (!m.regex_matches(v)) continue;
+                auto ids = idx.postings(m.name(), v);
+                if (!ids) return std::unexpected(ids.error());
+                matching.insert(matching.end(), ids->begin(), ids->end());
+            }
+            if (empty_matches_regex) {
+                auto all = idx.all_postings();
+                if (!all) return std::unexpected(all.error());
+                auto with = idx.postings_for_name(m.name());
+                if (!with) return std::unexpected(with.error());
+                auto without = sorted_difference(*all, *with);
+                matching.insert(matching.end(), without.begin(), without.end());
+            }
+            std::sort(matching.begin(), matching.end());
+            matching.erase(std::unique(matching.begin(), matching.end()),
+                           matching.end());
+            auto all = idx.all_postings();
+            if (!all) return std::unexpected(all.error());
+            return sorted_difference(*all, matching);
+        }
+    }
+    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+}
+
+}  // namespace
+
+std::expected<std::vector<Block::QueryResult>, std::error_code>
+Block::select(std::span<const model::Matcher> matchers,
+              std::int64_t mint,
+              std::int64_t maxt) const {
+    if (matchers.empty()) {
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+
+    // 1. Resolve each matcher to its posting list, intersect from the
+    //    smallest outward to minimize work. Sort matchers by initial
+    //    resolution size? Skip the optimization for MVP — resolve in
+    //    caller order and rely on sorted_intersection being O(n+m).
+    std::vector<std::uint32_t> ids;
+    {
+        auto first = postings_for_matcher(index_, matchers[0]);
+        if (!first) return std::unexpected(first.error());
+        ids = std::move(*first);
+    }
+    for (std::size_t i = 1; i < matchers.size() && !ids.empty(); ++i) {
+        auto next = postings_for_matcher(index_, matchers[i]);
+        if (!next) return std::unexpected(next.error());
+        ids = sorted_intersection(ids, *next);
+    }
+
+    // 2. Decode each surviving series, filter chunks by time range.
+    std::vector<QueryResult> out;
+    out.reserve(ids.size());
+    for (auto id : ids) {
+        auto series_or = index_.series(id);
+        if (!series_or) return std::unexpected(series_or.error());
+
+        QueryResult qr;
+        qr.labels = std::move(series_or->labels);
+        for (auto& cm : series_or->chunks) {
+            // Half-open overlap test: chunk [cm.min_time, cm.max_time]
+            // intersects query [mint, maxt] iff cm.min_time <= maxt &&
+            // cm.max_time >= mint. Upstream uses inclusive bounds on
+            // both sides; we follow.
+            if (cm.min_time > maxt || cm.max_time < mint) continue;
+            auto payload = chunks_.read(cm.chunk_ref());
+            if (!payload) return std::unexpected(payload.error());
+            if (payload->encoding != chunkenc::Encoding::XOR) {
+                return std::unexpected(std::make_error_code(std::errc::not_supported));
+            }
+            qr.chunks.push_back(
+                chunkenc::XORChunk::from_bytes(std::move(payload->data)));
+            qr.chunk_metas.push_back(cm);
+        }
+        // Drop series whose every chunk was outside the time range.
+        if (qr.chunks.empty()) continue;
+        out.push_back(std::move(qr));
+    }
+    return out;
+}
+
 std::expected<std::vector<Block::QueryResult>, std::error_code>
 Block::query(std::string_view name, std::string_view value) const {
     auto ids_or = index_.postings(name, value);
