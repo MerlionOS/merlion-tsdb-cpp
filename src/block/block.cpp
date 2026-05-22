@@ -206,6 +206,96 @@ Block::create_from_series(const std::filesystem::path& parent_dir,
 }
 
 std::expected<std::filesystem::path, std::error_code>
+Block::compact(const std::filesystem::path& parent_dir,
+               std::span<const std::filesystem::path> input_block_dirs) {
+    if (input_block_dirs.empty()) {
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+
+    // -------- Open every input block ---------------------------------------
+    std::vector<Block> blocks;
+    blocks.reserve(input_block_dirs.size());
+    int max_level = 0;
+    std::set<std::string> aggregated_sources;
+    for (const auto& dir : input_block_dirs) {
+        auto blk_or = Block::open(dir);
+        if (!blk_or) return std::unexpected(blk_or.error());
+        max_level = std::max(max_level, blk_or->meta().compaction.level);
+        for (const auto& src : blk_or->meta().compaction.sources) {
+            aggregated_sources.insert(src);
+        }
+        blocks.push_back(std::move(*blk_or));
+    }
+
+    // -------- Aggregate every series across every input block --------------
+    // Keyed on Labels (canonical form) → list of ChunkInputs collected from
+    // every block. The order we collect doesn't matter because we sort by
+    // min_time before writing.
+    std::unordered_map<model::Labels, std::vector<ChunkInput>, model::LabelsHash>
+        merged;
+
+    for (const auto& blk : blocks) {
+        // Walk every (name, value) entry in the postings table; collect
+        // distinct series IDs; for each ID materialise the series + its
+        // chunk metas, then load chunk bytes via the block's ChunkReader.
+        std::set<std::uint32_t> seen_ids;
+        for (const auto& entry : blk.index().postings_table().entries()) {
+            auto refs = read_posting_list(blk.index().bytes(), entry.offset);
+            if (!refs) return std::unexpected(refs.error());
+            for (auto id : *refs) seen_ids.insert(id);
+        }
+        for (auto id : seen_ids) {
+            auto se = blk.index().series(id);
+            if (!se) return std::unexpected(se.error());
+            auto& dst = merged[se->labels];
+            for (const auto& cm : se->chunks) {
+                auto payload = blk.chunks().read(cm.chunk_ref());
+                if (!payload) return std::unexpected(payload.error());
+                if (payload->encoding != chunkenc::Encoding::XOR) {
+                    return std::unexpected(
+                        std::make_error_code(std::errc::not_supported));
+                }
+                ChunkInput ci;
+                ci.min_time = cm.min_time;
+                ci.max_time = cm.max_time;
+                ci.bytes    = std::move(payload->data);
+                dst.push_back(std::move(ci));
+            }
+        }
+    }
+
+    // -------- Sort each series's chunks by min_time + flatten --------------
+    std::vector<SeriesInput> series_inputs;
+    series_inputs.reserve(merged.size());
+    for (auto& [labels, chunks] : merged) {
+        std::sort(chunks.begin(), chunks.end(),
+                  [](const ChunkInput& a, const ChunkInput& b) {
+                      return a.min_time < b.min_time;
+                  });
+        SeriesInput si;
+        si.labels = labels;
+        si.chunks = std::move(chunks);
+        series_inputs.push_back(std::move(si));
+    }
+
+    auto dir_or = create_from_series(parent_dir, series_inputs);
+    if (!dir_or) return std::unexpected(dir_or.error());
+
+    // -------- Patch meta.json with compaction info -------------------------
+    auto meta_or = read_meta(*dir_or);
+    if (!meta_or) return std::unexpected(meta_or.error());
+    auto meta = std::move(*meta_or);
+    meta.compaction.level   = max_level + 1;
+    meta.compaction.sources.assign(aggregated_sources.begin(),
+                                    aggregated_sources.end());
+    if (auto r = write_meta(*dir_or, meta); !r) {
+        return std::unexpected(r.error());
+    }
+
+    return dir_or;
+}
+
+std::expected<std::filesystem::path, std::error_code>
 Block::create_from_head(const std::filesystem::path& parent_dir,
                         const head::Head& head) {
     std::vector<SeriesInput> inputs;
