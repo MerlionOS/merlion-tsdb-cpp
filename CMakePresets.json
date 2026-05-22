@@ -1,0 +1,65 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-llvm.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (LLVM, libc++)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (LLVM, libc++, -O3)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (LLVM, libc++)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + ASan/UBSan",
+      "inherits": "debug",
+      "cacheVariables": { "MERLION_TSDB_ENABLE_ASAN": "ON" }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + TSan",
+      "inherits": "debug",
+      "cacheVariables": { "MERLION_TSDB_ENABLE_TSAN": "ON" }
+    },
+    {
+      "name": "bench",
+      "displayName": "Release + benchmarks",
+      "inherits": "release",
+      "cacheVariables": { "MERLION_TSDB_BUILD_BENCH": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",          "configurePreset": "debug" },
+    { "name": "release",        "configurePreset": "release" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "asan",           "configurePreset": "asan" },
+    { "name": "tsan",           "configurePreset": "tsan" },
+    { "name": "bench",          "configurePreset": "bench" }
+  ],
+  "testPresets": [
+    { "name": "debug",   "configurePreset": "debug",   "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "asan",    "configurePreset": "asan",    "output": { "outputOnFailure": true } }
+  ]
+}

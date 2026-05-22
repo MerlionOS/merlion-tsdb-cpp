@@ -1,0 +1,11 @@
+merlion-tsdb-cpp
+Copyright 2026 MerlionOS Contributors
+
+This product includes software developed at Prometheus
+(https://github.com/prometheus/prometheus), Copyright 2012-2025
+The Prometheus Authors, licensed under the Apache License, Version 2.0.
+
+This is a clean-room modern C++23 reimplementation of the Prometheus
+TSDB storage engine. On-disk formats (chunks, WAL, persistent blocks,
+index) follow Prometheus v3.x specifications to maintain wire-format
+compatibility, but no code is copied from the upstream Go project.

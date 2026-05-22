@@ -1,0 +1,16 @@
+---
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+NamespaceIndentation: None
+FixNamespaceComments: true
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+SortUsingDeclarations: true
+Standard: c++23

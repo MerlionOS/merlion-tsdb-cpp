@@ -1,0 +1,33 @@
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  hicpp-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -hicpp-no-array-decay,
+  -readability-identifier-length
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(src|include)/.*'
+
+CheckOptions:
+  readability-identifier-naming.NamespaceCase: lower_case
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.PrivateMemberSuffix: '_'
+  readability-identifier-naming.ConstantCase: lower_case
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.EnumConstantCase: CamelCase
