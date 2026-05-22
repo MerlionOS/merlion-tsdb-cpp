@@ -41,6 +41,7 @@ add_library(merlion_tsdb_core STATIC
     src/chunkenc/xor.cpp
     src/wal/page.cpp
     src/wal/segment_writer.cpp
+    src/wal/segment_reader.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
