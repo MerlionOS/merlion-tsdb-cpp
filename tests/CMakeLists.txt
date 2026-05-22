@@ -4,6 +4,7 @@ add_executable(merlion_tsdb_tests
     encoding/bstream_test.cpp
     encoding/crc32c_test.cpp
     chunkenc/xor_test.cpp
+    wal/page_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
