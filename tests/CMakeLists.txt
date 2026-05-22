@@ -16,6 +16,7 @@ add_executable(merlion_tsdb_tests
     block/meta_test.cpp
     block/chunks_test.cpp
     block/index_test.cpp
+    block/postings_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core

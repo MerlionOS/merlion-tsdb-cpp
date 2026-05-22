@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Persistent-block index file reader.
@@ -99,8 +102,55 @@ private:
     std::vector<std::size_t>      sparse_offsets_;       // V3 only: every 32nd entry
 };
 
-// Top-level index reader. Phase 3a only exposes header / TOC / symbols;
-// later phases add postings + series accessors.
+// Single entry in the postings offset table: a (label name, label value)
+// → posting list location pair. The offset is an absolute byte position in
+// the index file, pointing at the posting list's length prefix.
+struct PostingsOffsetEntry {
+    std::string   name;
+    std::string   value;
+    std::uint64_t offset = 0;
+
+    friend bool operator==(const PostingsOffsetEntry&, const PostingsOffsetEntry&) = default;
+};
+
+// Read-only view of the postings offset table (TOC section
+// `postings_table`). Holds the parsed entries plus a (name, value) ->
+// offset lookup map.
+class PostingsOffsetTable {
+public:
+    [[nodiscard]] static std::expected<PostingsOffsetTable, std::error_code>
+    parse(std::span<const std::uint8_t> file_bytes, std::size_t section_offset);
+
+    [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+    [[nodiscard]] std::span<const PostingsOffsetEntry> entries() const noexcept {
+        return {entries_.data(), entries_.size()};
+    }
+
+    // Returns the posting-list offset for (name, value), or empty if no
+    // such label pair has a posting list. Upstream does NOT guarantee the
+    // entries are sorted by (name, value), so we use a hash map built at
+    // parse time.
+    [[nodiscard]] std::optional<std::uint64_t>
+    lookup(std::string_view name, std::string_view value) const;
+
+private:
+    explicit PostingsOffsetTable(std::vector<PostingsOffsetEntry> entries);
+
+    std::vector<PostingsOffsetEntry> entries_;
+    // (name + '\0' + value) -> offset. Owning string keys; the entries_
+    // vector survives moves so it's also safe to point string_views at
+    // it, but a small owning map is simpler and dwarfed by entries_.
+    std::unordered_map<std::string, std::uint64_t> by_pair_;
+};
+
+// Decodes one posting list at the given offset and returns its sorted
+// series refs. `offset` points at the list's 4-byte length prefix
+// (matches the value stored in the postings offset table).
+[[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
+read_posting_list(std::span<const std::uint8_t> file_bytes, std::uint64_t offset);
+
+// Top-level index reader. Phase 3a exposes header / TOC / symbols; 3b
+// adds the postings offset table + posting list access.
 class IndexReader {
 public:
     [[nodiscard]] static std::expected<IndexReader, std::error_code>
@@ -109,20 +159,30 @@ public:
     [[nodiscard]] std::uint8_t version() const noexcept { return version_; }
     [[nodiscard]] const IndexTOC& toc() const noexcept { return toc_; }
     [[nodiscard]] const IndexSymbolTable& symbols() const noexcept { return symbols_; }
+    [[nodiscard]] const PostingsOffsetTable& postings_table() const noexcept {
+        return postings_table_;
+    }
     [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept {
         return {data_.data(), data_.size()};
     }
+
+    // Convenience: look up a (name, value) and return the posting list's
+    // sorted series refs in one call. Returns empty if no such pair.
+    [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
+    postings(std::string_view name, std::string_view value) const;
 
 private:
     IndexReader(std::vector<std::uint8_t> data,
                 std::uint8_t version,
                 IndexTOC toc,
-                IndexSymbolTable symbols) noexcept;
+                IndexSymbolTable symbols,
+                PostingsOffsetTable postings_table) noexcept;
 
     std::vector<std::uint8_t> data_;
     std::uint8_t              version_ = 0;
     IndexTOC                  toc_;
     IndexSymbolTable          symbols_;
+    PostingsOffsetTable       postings_table_;
 };
 
 // Helpers exposed for unit tests and the later index-section readers.

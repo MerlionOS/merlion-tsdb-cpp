@@ -1,5 +1,6 @@
 #include "merlion_tsdb/block/index.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <utility>
@@ -193,11 +194,13 @@ std::vector<std::string> IndexSymbolTable::all_symbols() const {
 IndexReader::IndexReader(std::vector<std::uint8_t> data,
                          std::uint8_t version,
                          IndexTOC toc,
-                         IndexSymbolTable symbols) noexcept
+                         IndexSymbolTable symbols,
+                         PostingsOffsetTable postings_table) noexcept
     : data_(std::move(data)),
       version_(version),
       toc_(toc),
-      symbols_(std::move(symbols)) {}
+      symbols_(std::move(symbols)),
+      postings_table_(std::move(postings_table)) {}
 
 std::expected<IndexReader, std::error_code>
 IndexReader::open(const std::filesystem::path& index_file) {
@@ -238,7 +241,137 @@ IndexReader::open(const std::filesystem::path& index_file) {
         version);
     if (!symbols_or) return std::unexpected(symbols_or.error());
 
-    return IndexReader{std::move(data), version, toc, std::move(*symbols_or)};
+    auto pot_or = PostingsOffsetTable::parse(
+        std::span<const std::uint8_t>{data},
+        static_cast<std::size_t>(toc.postings_table));
+    if (!pot_or) return std::unexpected(pot_or.error());
+
+    return IndexReader{std::move(data), version, toc,
+                       std::move(*symbols_or), std::move(*pot_or)};
+}
+
+std::expected<std::vector<std::uint32_t>, std::error_code>
+IndexReader::postings(std::string_view name, std::string_view value) const {
+    auto off = postings_table_.lookup(name, value);
+    if (!off) return std::vector<std::uint32_t>{};
+    return read_posting_list(std::span<const std::uint8_t>{data_}, *off);
+}
+
+// --- PostingsOffsetTable ----------------------------------------------------
+
+std::expected<PostingsOffsetTable, std::error_code>
+PostingsOffsetTable::parse(std::span<const std::uint8_t> file_bytes,
+                           std::size_t section_offset) {
+    auto payload_or = detail::read_section_payload(file_bytes, section_offset);
+    if (!payload_or) return std::unexpected(payload_or.error());
+    const auto payload = *payload_or;
+    if (payload.size() < 4) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    const std::uint32_t count = read_be32(payload.subspan(0, 4));
+    std::vector<PostingsOffsetEntry> entries;
+    entries.reserve(count);
+
+    std::size_t pos = 4;  // skip the leading count
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto keycount_or = varint::read_uvarint(payload.subspan(pos));
+        if (!keycount_or) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        pos += keycount_or->second;
+        // Upstream always writes 2 (name + value); be strict about that
+        // until a non-2 case actually exists in real data.
+        if (keycount_or->first != 2) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        // Read label name (uvarint length + bytes).
+        auto namelen_or = varint::read_uvarint(payload.subspan(pos));
+        if (!namelen_or) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        pos += namelen_or->second;
+        const auto namelen = static_cast<std::size_t>(namelen_or->first);
+        if (pos + namelen > payload.size()) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        std::string name(reinterpret_cast<const char*>(payload.data() + pos), namelen);
+        pos += namelen;
+
+        // Label value.
+        auto vallen_or = varint::read_uvarint(payload.subspan(pos));
+        if (!vallen_or) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        pos += vallen_or->second;
+        const auto vallen = static_cast<std::size_t>(vallen_or->first);
+        if (pos + vallen > payload.size()) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        std::string value(reinterpret_cast<const char*>(payload.data() + pos), vallen);
+        pos += vallen;
+
+        // Offset.
+        auto off_or = varint::read_uvarint(payload.subspan(pos));
+        if (!off_or) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        pos += off_or->second;
+
+        entries.push_back(
+            {std::move(name), std::move(value), off_or->first});
+    }
+    if (pos != payload.size()) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    return PostingsOffsetTable{std::move(entries)};
+}
+
+PostingsOffsetTable::PostingsOffsetTable(std::vector<PostingsOffsetEntry> entries)
+    : entries_(std::move(entries)) {
+    by_pair_.reserve(entries_.size());
+    for (const auto& e : entries_) {
+        std::string key;
+        key.reserve(e.name.size() + 1 + e.value.size());
+        key.append(e.name);
+        key.push_back('\0');
+        key.append(e.value);
+        by_pair_.emplace(std::move(key), e.offset);
+    }
+}
+
+std::optional<std::uint64_t>
+PostingsOffsetTable::lookup(std::string_view name,
+                            std::string_view value) const {
+    std::string key;
+    key.reserve(name.size() + 1 + value.size());
+    key.append(name);
+    key.push_back('\0');
+    key.append(value);
+    auto it = by_pair_.find(key);
+    if (it == by_pair_.end()) return std::nullopt;
+    return it->second;
+}
+
+// --- Posting list -----------------------------------------------------------
+
+std::expected<std::vector<std::uint32_t>, std::error_code>
+read_posting_list(std::span<const std::uint8_t> file_bytes, std::uint64_t offset) {
+    auto payload_or = detail::read_section_payload(file_bytes, static_cast<std::size_t>(offset));
+    if (!payload_or) return std::unexpected(payload_or.error());
+    const auto payload = *payload_or;
+    if (payload.size() < 4) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    const std::uint32_t count = read_be32(payload.subspan(0, 4));
+    if (payload.size() < 4 + 4ULL * count) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    std::vector<std::uint32_t> refs;
+    refs.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        refs.push_back(read_be32(payload.subspan(4 + 4ULL * i, 4)));
+    }
+    return refs;
 }
 
 }  // namespace merlion_tsdb::block
