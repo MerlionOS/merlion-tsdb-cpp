@@ -22,6 +22,7 @@ add_executable(merlion_tsdb_tests
     block/index_writer_test.cpp
     block/block_writer_test.cpp
     block/create_from_head_test.cpp
+    block/compact_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core

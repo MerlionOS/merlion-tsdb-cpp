@@ -111,6 +111,25 @@ public:
     create_from_head(const std::filesystem::path& parent_dir,
                      const head::Head& head);
 
+    // Compacts two or more existing blocks into a single new block under
+    // `parent_dir`. For each series present in any input block, the
+    // chunks are concatenated in `min_time`-ascending order. The new
+    // block's `compaction.level` becomes `max(input levels) + 1`; its
+    // `compaction.sources` is the union of every input's sources
+    // (deduplicated, lex-sorted for determinism).
+    //
+    // Assumes input blocks have non-overlapping time ranges per series —
+    // the standard compactor invariant. Overlap detection is not done
+    // here; if two inputs cover the same (series, timestamp), both
+    // chunks are kept and the output may contain duplicate samples on
+    // query.
+    //
+    // The input directories are NOT deleted — the caller is responsible
+    // for cleanup after verifying the new block.
+    [[nodiscard]] static std::expected<std::filesystem::path, std::error_code>
+    compact(const std::filesystem::path& parent_dir,
+            std::span<const std::filesystem::path> input_block_dirs);
+
 private:
     Block(std::filesystem::path dir,
           BlockMeta meta,
