@@ -56,6 +56,118 @@ read_section_payload(std::span<const std::uint8_t> file_bytes,
     return payload;
 }
 
+std::expected<std::span<const std::uint8_t>, std::error_code>
+read_uvarint_section_payload(std::span<const std::uint8_t> file_bytes,
+                             std::size_t offset) {
+    if (offset >= file_bytes.size()) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    auto len_r = varint::read_uvarint(file_bytes.subspan(offset));
+    if (!len_r) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    const auto payload_off = offset + len_r->second;
+    const auto len = static_cast<std::size_t>(len_r->first);
+    if (payload_off + len + 4 > file_bytes.size()) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    const auto payload = file_bytes.subspan(payload_off, len);
+    const auto stored_crc =
+        read_be32(file_bytes.subspan(payload_off + len, 4));
+    if (crc32c::compute(payload) != stored_crc) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    return payload;
+}
+
+std::expected<SeriesEntry, std::error_code>
+decode_series_payload(std::span<const std::uint8_t> payload,
+                      const IndexSymbolTable& symbols) {
+    std::size_t pos = 0;
+    auto read_uv = [&](std::uint64_t& out) -> bool {
+        auto r = varint::read_uvarint(payload.subspan(pos));
+        if (!r) return false;
+        out = r->first;
+        pos += r->second;
+        return true;
+    };
+    auto read_v = [&](std::int64_t& out) -> bool {
+        auto r = varint::read_varint(payload.subspan(pos));
+        if (!r) return false;
+        out = r->first;
+        pos += r->second;
+        return true;
+    };
+
+    SeriesEntry entry;
+    std::uint64_t k = 0;
+    if (!read_uv(k)) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    std::vector<model::Label> labels;
+    labels.reserve(static_cast<std::size_t>(k));
+    for (std::uint64_t i = 0; i < k; ++i) {
+        std::uint64_t lno = 0;
+        std::uint64_t lvo = 0;
+        if (!read_uv(lno) || !read_uv(lvo)) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        auto name = symbols.lookup(static_cast<std::uint32_t>(lno));
+        auto value = symbols.lookup(static_cast<std::uint32_t>(lvo));
+        if (!name || !value) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        labels.push_back({std::string{*name}, std::string{*value}});
+    }
+    entry.labels = model::Labels{std::move(labels)};
+
+    // Chunks.
+    if (!read_uv(k)) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    if (k == 0) return entry;
+
+    entry.chunks.reserve(static_cast<std::size_t>(k));
+    std::int64_t t0 = 0;
+    if (!read_v(t0)) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    std::uint64_t maxt_delta = 0;
+    if (!read_uv(maxt_delta)) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    std::int64_t maxt = static_cast<std::int64_t>(maxt_delta) + t0;
+    std::uint64_t ref0 = 0;
+    if (!read_uv(ref0)) {
+        return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+    }
+    entry.chunks.push_back({t0, maxt, ref0});
+    t0 = maxt;
+    std::int64_t signed_ref = static_cast<std::int64_t>(ref0);
+
+    for (std::uint64_t i = 1; i < k; ++i) {
+        std::uint64_t mint_delta = 0;
+        if (!read_uv(mint_delta)) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        const std::int64_t mint = static_cast<std::int64_t>(mint_delta) + t0;
+        std::uint64_t maxt_d = 0;
+        if (!read_uv(maxt_d)) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        const std::int64_t this_maxt = static_cast<std::int64_t>(maxt_d) + mint;
+        std::int64_t ref_delta = 0;
+        if (!read_v(ref_delta)) {
+            return std::unexpected(std::make_error_code(std::errc::illegal_byte_sequence));
+        }
+        signed_ref += ref_delta;
+        entry.chunks.push_back({mint, this_maxt,
+                                static_cast<std::uint64_t>(signed_ref)});
+        t0 = this_maxt;
+    }
+    return entry;
+}
+
 std::expected<IndexTOC, std::error_code>
 parse_toc(std::span<const std::uint8_t> file_bytes) {
     if (file_bytes.size() < k_index_toc_size) {
@@ -255,6 +367,19 @@ IndexReader::postings(std::string_view name, std::string_view value) const {
     auto off = postings_table_.lookup(name, value);
     if (!off) return std::vector<std::uint32_t>{};
     return read_posting_list(std::span<const std::uint8_t>{data_}, *off);
+}
+
+std::expected<SeriesEntry, std::error_code>
+IndexReader::series(std::uint64_t id) const {
+    // V1: id is the absolute file offset. V2/V3: actual offset = id * 16
+    // (series entries are 16-byte aligned).
+    const std::size_t offset = (version_ == k_index_format_v1)
+                                   ? static_cast<std::size_t>(id)
+                                   : static_cast<std::size_t>(id) * 16U;
+    auto payload_or = detail::read_uvarint_section_payload(
+        std::span<const std::uint8_t>{data_}, offset);
+    if (!payload_or) return std::unexpected(payload_or.error());
+    return detail::decode_series_payload(*payload_or, symbols_);
 }
 
 // --- PostingsOffsetTable ----------------------------------------------------

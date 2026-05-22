@@ -12,6 +12,9 @@
 #include <utility>
 #include <vector>
 
+#include "merlion_tsdb/block/chunks.hpp"
+#include "merlion_tsdb/model/labels.hpp"
+
 // Persistent-block index file reader.
 //
 // Index file layout:
@@ -149,6 +152,27 @@ private:
 [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
 read_posting_list(std::span<const std::uint8_t> file_bytes, std::uint64_t offset);
 
+// Per-chunk metadata stored on each series entry. `ref` is the
+// BlockChunkRef u64 packing (file_seq << 32 | byte_offset) pointing into
+// the block's chunks/ directory.
+struct ChunkMeta {
+    std::int64_t  min_time = 0;
+    std::int64_t  max_time = 0;
+    std::uint64_t ref      = 0;
+
+    [[nodiscard]] BlockChunkRef chunk_ref() const noexcept {
+        return BlockChunkRef::from_u64(ref);
+    }
+    friend bool operator==(const ChunkMeta&, const ChunkMeta&) = default;
+};
+
+// One decoded series — label set (sorted, canonical) + chunk meta list.
+struct SeriesEntry {
+    model::Labels          labels;
+    std::vector<ChunkMeta> chunks;
+    friend bool operator==(const SeriesEntry&, const SeriesEntry&) = default;
+};
+
 // Top-level index reader. Phase 3a exposes header / TOC / symbols; 3b
 // adds the postings offset table + posting list access.
 class IndexReader {
@@ -170,6 +194,13 @@ public:
     // sorted series refs in one call. Returns empty if no such pair.
     [[nodiscard]] std::expected<std::vector<std::uint32_t>, std::error_code>
     postings(std::string_view name, std::string_view value) const;
+
+    // Decode one series entry by its ID (as written in posting lists).
+    // V1: id is the absolute file offset of the entry's length prefix.
+    // V2/V3: id is the byte offset divided by 16 (series entries are
+    //        16-byte aligned).
+    [[nodiscard]] std::expected<SeriesEntry, std::error_code>
+    series(std::uint64_t id) const;
 
 private:
     IndexReader(std::vector<std::uint8_t> data,
@@ -197,6 +228,20 @@ parse_toc(std::span<const std::uint8_t> file_bytes);
 [[nodiscard]] std::expected<std::span<const std::uint8_t>, std::error_code>
 read_section_payload(std::span<const std::uint8_t> file_bytes,
                      std::size_t offset);
+
+// Variant of read_section_payload where the length prefix is a uvarint
+// instead of a u32 BE. Matches Go's NewDecbufUvarintAt and is used by
+// the series section.
+[[nodiscard]] std::expected<std::span<const std::uint8_t>, std::error_code>
+read_uvarint_section_payload(std::span<const std::uint8_t> file_bytes,
+                             std::size_t offset);
+
+// Decode a single series entry from a raw payload span (the inner bytes
+// already unwrapped from the uvarint-length + CRC framing). Exposed so
+// tests and the future block writer can exercise the decoder directly.
+[[nodiscard]] std::expected<SeriesEntry, std::error_code>
+decode_series_payload(std::span<const std::uint8_t> payload,
+                      const IndexSymbolTable& symbols);
 
 }  // namespace detail
 
