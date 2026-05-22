@@ -14,6 +14,7 @@ add_executable(merlion_tsdb_tests
     head/head_test.cpp
     head/head_replay_test.cpp
     block/meta_test.cpp
+    block/chunks_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
