@@ -24,6 +24,7 @@ add_executable(merlion_tsdb_tests
     block/create_from_head_test.cpp
     block/compact_test.cpp
     block/select_test.cpp
+    querier/querier_test.cpp
 )
 target_link_libraries(merlion_tsdb_tests PRIVATE
     merlion_tsdb_core
