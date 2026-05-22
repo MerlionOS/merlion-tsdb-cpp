@@ -46,6 +46,7 @@ add_library(merlion_tsdb_core STATIC
     src/model/labels.cpp
     src/head/mem_series.cpp
     src/head/series_store.cpp
+    src/head/head.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
