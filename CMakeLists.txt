@@ -54,6 +54,7 @@ add_library(merlion_tsdb_core STATIC
     src/wal/segment_reader.cpp
     src/wal/record.cpp
     src/model/labels.cpp
+    src/model/matcher.cpp
     src/head/mem_series.cpp
     src/head/series_store.cpp
     src/head/head.cpp

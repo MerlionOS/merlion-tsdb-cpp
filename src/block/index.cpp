@@ -369,6 +369,47 @@ IndexReader::postings(std::string_view name, std::string_view value) const {
     return read_posting_list(std::span<const std::uint8_t>{data_}, *off);
 }
 
+std::expected<std::vector<std::uint32_t>, std::error_code>
+IndexReader::postings_for_name(std::string_view name) const {
+    std::vector<std::uint32_t> out;
+    for (const auto& e : postings_table_.entries()) {
+        if (e.name != name) continue;
+        auto ids = read_posting_list(std::span<const std::uint8_t>{data_}, e.offset);
+        if (!ids) return std::unexpected(ids.error());
+        // Merge sorted runs — each posting list is itself sorted, so a
+        // single sort+unique at the end is fine (lists are small in
+        // typical blocks).
+        out.insert(out.end(), ids->begin(), ids->end());
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::expected<std::vector<std::uint32_t>, std::error_code>
+IndexReader::all_postings() const {
+    std::vector<std::uint32_t> out;
+    for (const auto& e : postings_table_.entries()) {
+        auto ids = read_posting_list(std::span<const std::uint8_t>{data_}, e.offset);
+        if (!ids) return std::unexpected(ids.error());
+        out.insert(out.end(), ids->begin(), ids->end());
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::vector<std::string>
+IndexReader::label_values(std::string_view name) const {
+    std::vector<std::string> out;
+    for (const auto& e : postings_table_.entries()) {
+        if (e.name == name) out.push_back(e.value);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 std::expected<SeriesEntry, std::error_code>
 IndexReader::series(std::uint64_t id) const {
     // V1: id is the absolute file offset. V2/V3: actual offset = id * 16
