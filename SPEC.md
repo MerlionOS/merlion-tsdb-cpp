@@ -270,7 +270,7 @@ Tests: `merlion-tsdb-cpp/tests/encoding/bstream_test.cpp` (19 cases, also passes
 
 ## §3. Chunk encoders
 
-### §3.1 XOR / Gorilla (`Encoding::Xor`, tag = 1) 🟡
+### §3.1 XOR / Gorilla (`Encoding::Xor`, tag = 1) ✅
 
 Algorithm from the [Gorilla paper](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf), adapted by Damian Gryski (`go-tsz`) and minor-tweaked by Prometheus. Encodes a sequence of `(timestamp: i64, value: f64)` samples into a self-contained byte slice.
 
@@ -407,7 +407,7 @@ value = f64::from_bits(value.to_bits() ^ (bits << trailing))
 #### Reference implementations
 
 - Go: `prometheus/tsdb/chunkenc/xor.go`
-- C++: `merlion-tsdb-cpp/src/chunkenc/xor.cpp` (in progress at the time of writing this section).
+- C++: `merlion-tsdb-cpp/src/chunkenc/xor.cpp` — implemented; 12 test cases pass under Debug + ASan/UBSan, covering: empty chunk, single sample, two samples, constant value (xor=0 path), regular intervals (dod=0 path), irregular dods (all 5 prefix buckets), negative dods (sign-extension), 500-sample random fuzz with NaN/Inf, mid-chunk appender replay, `from_bytes` roundtrip, `compact()` idempotence.
 
 ### §3.2 XOR2 (`Encoding::Xor2`, tag = 4) ⬜
 
@@ -499,3 +499,4 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 ## Changelog
 
 - **2026-05-22** — Initial draft. §1, §2, §3.1 in detail; §3.2–§7 are skeletons pending implementation.
+- **2026-05-22** — §3.1 promoted from Drafted to Final. C++ implementation landed in `merlion-tsdb-cpp` with 12 passing tests (Debug + ASan/UBSan).

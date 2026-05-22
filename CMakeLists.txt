@@ -37,6 +37,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_library(merlion_tsdb_core STATIC
     src/encoding/bstream.cpp
     src/encoding/varint.cpp
+    src/chunkenc/xor.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
