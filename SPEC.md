@@ -1027,6 +1027,59 @@ These walk the postings offset table once; cost scales with the number of distin
 
 ---
 
+## §9. Cross-block Querier ✅
+
+### §9.1 Surface
+
+```
+Querier(blocks)                            // non-owning, fixed
+querier.select(matchers, mint, maxt) -> [MergedSeries]
+
+MergedSeries { labels, chunks[], chunk_metas[] }
+```
+
+The Querier accepts N non-owning `Block*`. Each call to `select` evaluates the matcher set against every block independently, then merges results across blocks per label set. The merged chunk sequence is sorted by `min_time` ascending — matching upstream's `chainedSeriesIterator` invariant so callers can walk the sequence without re-sorting.
+
+Empty matcher sets are rejected (same rule as `Block::select`). Empty block list returns an empty result (not an error). Null pointers in the block span are skipped.
+
+### §9.2 Algorithm
+
+```
+for each block in blocks:
+    if block.meta.[min_time, max_time] does not overlap [mint, maxt]:
+        skip                                          # no I/O on out-of-range blocks
+    per_block := block.select(matchers, mint, maxt)
+    for each {labels, chunks, chunk_metas} in per_block:
+        bucket[labels].append(chunks, chunk_metas)
+sort each bucket entry by chunk_metas[i].min_time ascending
+return buckets as MergedSeries
+```
+
+Buckets are stored in a `std::unordered_map<Labels, MergedSeries, LabelsHash>`. Output order is bucket-traversal order (hash-stable per run but otherwise unspecified); callers that need deterministic series ordering must sort the result themselves.
+
+### §9.3 Cross-block overlap
+
+Two blocks at the **same compaction level** are time-disjoint by construction — Prometheus runs compactions sequentially and a level-N output replaces its level-(N−1) inputs. The Querier inherits this invariant: in steady state, a series's chunks from different blocks cover disjoint time windows and the post-sort sequence is well-ordered with no overlap.
+
+During a compaction window, a level-(N−1) block and the partially-built level-N block may briefly cover overlapping ranges. Detecting that and applying sample-level vertical merge across blocks is out of scope for §9 — `Block::compact` (§7) already does sample-level dedup inside the merged output, so once the new block is sealed the invariant is restored.
+
+If the caller passes truly overlapping blocks anyway (e.g. cross-level), the Querier returns all surviving chunks; chunks from different blocks at the same timestamp produce duplicate samples on iteration. Sample-level pruning is the caller's job (consistent with §8.1's chunk-handoff contract).
+
+### §9.4 Out of scope
+
+- Head support — a `HeadQuerier` (§10) will adapt the in-memory head to the same `select` surface, and `Querier` will accept it alongside blocks.
+- `SelectHints` / `sortSeries` — upstream knobs not yet modeled.
+- Cross-block sample-level vertical merge — see §9.3.
+- Tombstone application — chunks are returned untransformed (same as §8.5).
+
+### §9.5 C++ reference
+
+- `merlion-tsdb-cpp/include/merlion_tsdb/querier/querier.hpp` — interface
+- `merlion-tsdb-cpp/src/querier/querier.cpp` — implementation
+- `merlion-tsdb-cpp/tests/querier/querier_test.cpp` — 9 tests covering single-block parity, same-series cross-block merge, disjoint-series union, time-range block skipping, per-block matcher application, null/empty handling
+
+---
+
 ## Appendix A. Pitfalls catalogue
 
 Real bugs encountered or anticipated during porting. Each line is a "do not repeat":
@@ -1070,3 +1123,4 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 - **2026-05-22** — §3.1 promoted from Drafted to Final. C++ implementation landed in `merlion-tsdb-cpp` with 12 passing tests (Debug + ASan/UBSan).
 - **2026-05-22** — §4 WAL, §5 Head, §6 Persistent block all promoted to Final. New §7 Compaction added (level promotion + source aggregation). Old §7 Tombstones folded into §6.8 (still deferred for read; MVP writes empty). Pitfalls catalogue extended to 19 items, capturing every wire-format gotcha that surfaced during the C++ port. `merlion-tsdb-cpp` carries the reference implementation with 206 passing tests (Debug + ASan/UBSan), including end-to-end roundtrip: append → Head → WAL → flush → block → query → decode → bit-level parity.
 - **2026-05-23** — §7 promoted to vertical-merge with sample-level dedup (last-input-wins); previous "verbatim concat" wording removed. §8 Querier added (matchers + time-range filter + posting-list intersect). `merlion-tsdb-cpp` carries 222 passing tests (Debug + ASan/UBSan).
+- **2026-05-23** — §9 Cross-block Querier added: hash-bucket merge of per-block `select` results, chunks sorted by min_time across blocks, block-level time-range short-circuit. `merlion-tsdb-cpp` carries 231 passing tests (Debug + ASan/UBSan).
