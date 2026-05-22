@@ -39,6 +39,7 @@ add_library(merlion_tsdb_core STATIC
     src/encoding/varint.cpp
     src/encoding/crc32c.cpp
     src/chunkenc/xor.cpp
+    src/wal/page.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
