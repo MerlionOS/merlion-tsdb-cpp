@@ -42,6 +42,7 @@ add_library(merlion_tsdb_core STATIC
     src/wal/page.cpp
     src/wal/segment_writer.cpp
     src/wal/segment_reader.cpp
+    src/wal/record.cpp
 )
 target_include_directories(merlion_tsdb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
