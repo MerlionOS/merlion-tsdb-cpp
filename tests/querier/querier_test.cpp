@@ -14,11 +14,13 @@
 
 #include "merlion_tsdb/block/block.hpp"
 #include "merlion_tsdb/chunkenc/xor.hpp"
+#include "merlion_tsdb/head/head.hpp"
 #include "merlion_tsdb/model/labels.hpp"
 #include "merlion_tsdb/model/matcher.hpp"
 
 namespace b = merlion_tsdb::block;
 namespace c = merlion_tsdb::chunkenc;
+namespace h = merlion_tsdb::head;
 namespace m = merlion_tsdb::model;
 namespace q = merlion_tsdb::querier;
 
@@ -293,4 +295,170 @@ TEST(Querier, NullBlockPointersAreSkipped) {
     auto r = qr.select(ms, k_min, k_max);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->size(), 1u);
+}
+
+// -----------------------------------------------------------------------
+// §10: unified queries across Block + Head
+// -----------------------------------------------------------------------
+
+TEST(Querier, HeadOnlyConstructorRunsMatchersAgainstHead) {
+    TempDir tmp;
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 10, 1.0).has_value());
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 20, 2.0).has_value());
+
+    const h::Head* heads[] = {&head};
+    q::Querier qr{std::span<const b::Block* const>{},
+                  std::span<const h::Head* const>{heads}};
+
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].labels, (m::Labels{{"k", "v"}}));
+    auto samples = decode_all((*r)[0]);
+    ASSERT_EQ(samples.size(), 2u);
+    EXPECT_EQ(samples[0].first, 10);
+    EXPECT_EQ(samples[1].first, 20);
+}
+
+TEST(Querier, HeadAndBlockSameSeriesMergeChunksInTimeOrder) {
+    // Block holds the "old" chunk window [0, 100]; Head holds the
+    // "recent" chunk at [200, 300]. The unified querier must return one
+    // MergedSeries with chunks ordered by min_time across sources, NOT
+    // by block-then-head insertion order.
+    TempDir tmp;
+    auto d = make_block(tmp.path() / "blk", {
+        series(m::Labels{{"k", "v"}},
+               {make_chunk({{0, 1.0}, {100, 2.0}})}),
+    });
+    auto blk = *b::Block::open(d);
+
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 200, 3.0).has_value());
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 300, 4.0).has_value());
+
+    const b::Block* blocks[] = {&blk};
+    const h::Head*  heads[]  = {&head};
+    q::Querier qr{std::span<const b::Block* const>{blocks},
+                  std::span<const h::Head* const>{heads}};
+
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    const auto& s = (*r)[0];
+    ASSERT_EQ(s.chunk_metas.size(), 2u);
+    EXPECT_EQ(s.chunk_metas[0].min_time, 0);    // block chunk first
+    EXPECT_EQ(s.chunk_metas[1].min_time, 200);  // head chunk after
+
+    auto samples = decode_all(s);
+    ASSERT_EQ(samples.size(), 4u);
+    EXPECT_EQ(samples.front().first, 0);
+    EXPECT_EQ(samples.back().first, 300);
+}
+
+TEST(Querier, HeadChunkComesBeforeBlockChunkWhenTimesDictate) {
+    // Head holds the *earlier* chunk; Block holds the later one. The
+    // sort by min_time must promote the head chunk to position 0 even
+    // though heads are processed after blocks internally.
+    TempDir tmp;
+    auto d = make_block(tmp.path() / "blk", {
+        series(m::Labels{{"k", "v"}},
+               {make_chunk({{500, 5.0}, {600, 6.0}})}),
+    });
+    auto blk = *b::Block::open(d);
+
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 10, 1.0).has_value());
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 20, 2.0).has_value());
+
+    const b::Block* blocks[] = {&blk};
+    const h::Head*  heads[]  = {&head};
+    q::Querier qr{std::span<const b::Block* const>{blocks},
+                  std::span<const h::Head* const>{heads}};
+
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    const auto& s = (*r)[0];
+    ASSERT_EQ(s.chunk_metas.size(), 2u);
+    EXPECT_EQ(s.chunk_metas[0].min_time, 10);   // head chunk first
+    EXPECT_EQ(s.chunk_metas[1].min_time, 500);
+}
+
+TEST(Querier, HeadOnlySeriesUnionsWithBlockOnlySeries) {
+    // Head holds `{k=head_only}` and block holds `{k=block_only}`. A
+    // matcher that admits both should return two distinct MergedSeries.
+    TempDir tmp;
+    auto d = make_block(tmp.path() / "blk", {
+        series(m::Labels{{"k", "block_only"}}, {make_chunk({{0, 1.0}})}),
+    });
+    auto blk = *b::Block::open(d);
+
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "head_only"}}, 10, 2.0).has_value());
+
+    const b::Block* blocks[] = {&blk};
+    const h::Head*  heads[]  = {&head};
+    q::Querier qr{std::span<const b::Block* const>{blocks},
+                  std::span<const h::Head* const>{heads}};
+
+    auto re = m::Matcher::regex("k", ".*_only");
+    ASSERT_TRUE(re.has_value());
+    auto r = qr.select(std::array{*re}, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 2u);
+}
+
+TEST(Querier, TimeRangeFiltersHeadAndBlockIndependently) {
+    // Block chunk at [0, 100]; head chunk at [200, 300]. Query [250, 400]
+    // must drop the block chunk and keep the head chunk.
+    TempDir tmp;
+    auto d = make_block(tmp.path() / "blk", {
+        series(m::Labels{{"k", "v"}},
+               {make_chunk({{0, 1.0}, {100, 2.0}})}),
+    });
+    auto blk = *b::Block::open(d);
+
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 200, 3.0).has_value());
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 300, 4.0).has_value());
+
+    const b::Block* blocks[] = {&blk};
+    const h::Head*  heads[]  = {&head};
+    q::Querier qr{std::span<const b::Block* const>{blocks},
+                  std::span<const h::Head* const>{heads}};
+
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, 250, 400);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    ASSERT_EQ((*r)[0].chunks.size(), 1u);
+    EXPECT_EQ((*r)[0].chunk_metas[0].min_time, 200);  // only head chunk survives
+}
+
+TEST(Querier, NullHeadPointersAreSkipped) {
+    TempDir tmp;
+    auto head = *h::Head::open(tmp.path() / "head");
+    ASSERT_TRUE(head.append(m::Labels{{"k", "v"}}, 0, 1.0).has_value());
+
+    const h::Head* heads[] = {nullptr, &head, nullptr};
+    q::Querier qr{std::span<const b::Block* const>{},
+                  std::span<const h::Head* const>{heads}};
+
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 1u);
+}
+
+TEST(Querier, EmptyHeadAndBlockListsReturnEmptyResult) {
+    q::Querier qr{std::span<const b::Block* const>{},
+                  std::span<const h::Head* const>{}};
+    std::array ms{m::Matcher::equal("k", "v")};
+    auto r = qr.select(ms, k_min, k_max);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty());
 }

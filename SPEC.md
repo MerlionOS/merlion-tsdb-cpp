@@ -1067,16 +1067,92 @@ If the caller passes truly overlapping blocks anyway (e.g. cross-level), the Que
 
 ### §9.4 Out of scope
 
-- Head support — a `HeadQuerier` (§10) will adapt the in-memory head to the same `select` surface, and `Querier` will accept it alongside blocks.
 - `SelectHints` / `sortSeries` — upstream knobs not yet modeled.
 - Cross-block sample-level vertical merge — see §9.3.
 - Tombstone application — chunks are returned untransformed (same as §8.5).
+
+(Head support landed in §10 — `Querier` now accepts a span of `Head*` alongside its `Block*` span.)
 
 ### §9.5 C++ reference
 
 - `merlion-tsdb-cpp/include/merlion_tsdb/querier/querier.hpp` — interface
 - `merlion-tsdb-cpp/src/querier/querier.cpp` — implementation
 - `merlion-tsdb-cpp/tests/querier/querier_test.cpp` — 9 tests covering single-block parity, same-series cross-block merge, disjoint-series union, time-range block skipping, per-block matcher application, null/empty handling
+
+---
+
+## §10. Head querier ✅
+
+### §10.1 Surface
+
+The head exposes the same `select` shape as a persistent block, so a unified Querier can mix in-memory and on-disk data within a single query.
+
+```
+Head::select(matchers, mint, maxt) -> [{labels, chunks, chunk_metas}]
+```
+
+The result struct mirrors `Block::QueryResult` field-for-field. `block::ChunkMeta` is reused as the chunk-handoff type so the §9 Querier can merge head results and block results without an adapter layer. The `ref` field on a head-sourced `ChunkMeta` is left as `0` — in-memory chunks have no on-disk byte address.
+
+Empty matcher sets are rejected (same rule as `Block::select`). A series whose every chunk falls outside the time range is dropped entirely.
+
+### §10.2 Algorithm
+
+```
+for each MemSeries s in series_store:
+    if s has no samples: skip
+    if any matcher rejects s.labels: skip      # §8.2 empty-value rules
+    for each chunk c in s.chunks:
+        cmin := first sample t in c            # one-pass iterate
+        cmax := last  sample t in c
+        if (cmin, cmax) doesn't overlap [mint, maxt]: skip
+        snapshot c.bytes into a fresh XORChunk # owned copy
+        emit (cmin, cmax, ref=0)
+```
+
+XOR encoding emits samples in monotonic-`t` order, so the first sample's timestamp is the chunk's `min_time` and the last is its `max_time` — no separate index needed.
+
+### §10.3 Snapshot semantics
+
+`Head::select` **copies** each surviving chunk's bytes into a freshly-wrapped `XORChunk` before returning. This is the load-bearing safety invariant: the underlying `MemSeries` may still be appended to between this call and when the caller iterates the returned chunks. Without the copy, an in-flight append into the current chunk could reallocate the byte buffer and invalidate the iterator.
+
+The copy is `O(chunk bytes)`, bounded by the 1 KiB pre-cut threshold (`MemSeries::k_max_bytes_per_chunk_before_append`). In a workload with `S` series × `C` chunks/series each, that's ≤ `S · C · 1024` bytes — negligible at typical fanouts.
+
+### §10.4 Matcher application
+
+Identical to `Block::select` (§8.2). A label absent from the series is treated as having value `""`. The full matrix:
+
+- `Eq(N, "")` → series WITHOUT `N` (and any with `N=""` — Head, like Block, never holds empty-value labels in canonical form)
+- `Neq(N, "")` → series WITH `N` (non-empty)
+- `Re(N, p)` where `p` matches `""` → also include series without `N`
+- `Nre(N, p)` where `p` does NOT match `""` → also include series without `N`
+
+There is no posting-list shortcut at the Head — the in-memory series count is bounded and matcher evaluation is linear in series count regardless. A future enhancement could mirror the postings table for large heads; not pursued in MVP.
+
+### §10.5 Unified Querier
+
+`querier::Querier` gains a second constructor:
+
+```cpp
+Querier(span<const Block* const> blocks,
+        span<const Head*  const> heads);
+```
+
+Either span may be empty; the single-arg constructor (`blocks` only) still works. `select` runs the matcher set against every block (with block-meta time-range short-circuit per §9.2) AND every non-null head. Per-source results are hash-bucketed on `Labels`, then per-bucket chunks are sorted ascending by `min_time`. The sort is global across sources: a head chunk with `min_time = 10` will sort ahead of a block chunk with `min_time = 500` even though heads are iterated after blocks internally.
+
+### §10.6 Out of scope
+
+- Sample-level dedup across Head and Block when they cover overlapping time windows (e.g. during a head→block flush). Cross-source overlap is rare in steady state — the flush atomically retires the old head segment as the new block lands — but transient overlap is possible. Returning duplicate samples is consistent with §9.3's chunk-handoff contract; PromQL-level dedup is the caller's job.
+- Concurrent appender ↔ select coordination. MVP is single-threaded: callers must not `append()` concurrently with `select()`. Stripe locking and snapshot stability with concurrent writers are future work.
+- Tombstone application — chunks are returned untransformed (same as §8.5).
+
+### §10.7 C++ reference
+
+- `merlion-tsdb-cpp/include/merlion_tsdb/head/head.hpp::Head::select` — interface + `QueryResult` struct
+- `merlion-tsdb-cpp/src/head/head.cpp::Head::select` — implementation
+- `merlion-tsdb-cpp/include/merlion_tsdb/querier/querier.hpp` — extended `Querier` accepting both `Block*` and `Head*` spans
+- `merlion-tsdb-cpp/src/querier/querier.cpp` — unified merge implementation
+- `merlion-tsdb-cpp/tests/head/head_select_test.cpp` — 16 tests covering matcher matrix, time-range filter, anchored regex, empty-value semantics, snapshot independence from further appends, empty-head/no-match edge cases
+- `merlion-tsdb-cpp/tests/querier/querier_test.cpp` — 7 additional tests covering head-only Querier, head+block same-series chunk-time ordering (both directions), disjoint-series union across sources, per-source time-range filter, null head pointer handling
 
 ---
 
@@ -1124,3 +1200,4 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 - **2026-05-22** — §4 WAL, §5 Head, §6 Persistent block all promoted to Final. New §7 Compaction added (level promotion + source aggregation). Old §7 Tombstones folded into §6.8 (still deferred for read; MVP writes empty). Pitfalls catalogue extended to 19 items, capturing every wire-format gotcha that surfaced during the C++ port. `merlion-tsdb-cpp` carries the reference implementation with 206 passing tests (Debug + ASan/UBSan), including end-to-end roundtrip: append → Head → WAL → flush → block → query → decode → bit-level parity.
 - **2026-05-23** — §7 promoted to vertical-merge with sample-level dedup (last-input-wins); previous "verbatim concat" wording removed. §8 Querier added (matchers + time-range filter + posting-list intersect). `merlion-tsdb-cpp` carries 222 passing tests (Debug + ASan/UBSan).
 - **2026-05-23** — §9 Cross-block Querier added: hash-bucket merge of per-block `select` results, chunks sorted by min_time across blocks, block-level time-range short-circuit. `merlion-tsdb-cpp` carries 231 passing tests (Debug + ASan/UBSan).
+- **2026-05-24** — §10 Head querier added: `Head::select` mirrors `Block::select` (matcher + time-range filter + chunk snapshot), and `querier::Querier` gains a second constructor accepting `Head*` alongside `Block*` so a single query can mix in-memory and on-disk data. Snapshot semantics: head chunks are copied at `select` time so the result outlives further appends. `merlion-tsdb-cpp` carries 254 passing tests (Debug + ASan/UBSan).

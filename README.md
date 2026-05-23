@@ -2,7 +2,7 @@
 
 Modern C++23 reimplementation of the [Prometheus](https://github.com/prometheus/prometheus) TSDB storage engine.
 
-> **Status: alpha.** Read + write + compact + query paths all land bit-for-bit compatible with upstream v3.x format. 231 tests pass under Debug + ASan/UBSan. SPEC.md §1-§9 Final. Live progress in [ROADMAP.md](ROADMAP.md).
+> **Status: alpha.** Read + write + compact + query paths (across persistent blocks AND the in-memory head, unified in one querier) all land bit-for-bit compatible with upstream v3.x format. 254 tests pass under Debug + ASan/UBSan. SPEC.md §1-§10 Final. Live progress in [ROADMAP.md](ROADMAP.md).
 
 ## Goals
 
@@ -28,8 +28,8 @@ Modern C++23 reimplementation of the [Prometheus](https://github.com/prometheus/
 | Compactor (vertical-merge dedup) | `tsdb/compact.go` | ✅ Final |
 | Matchers + block querier | `pkg/labels`, `tsdb.BlockQuerier` | ✅ Final |
 | Cross-block querier | `storage.MergeSeriesSet` | ✅ Final |
-| Head querier (in-memory `select`) | `tsdb.HeadQuerier` | ⬜ Next (§10) |
-| Histogram chunks (integer + float) | `tsdb/chunkenc/histogram*.go` | ⬜ |
+| Head querier + unified Querier (Head + Block) | `tsdb.HeadQuerier`, `storage.MergeSeriesSet` | ✅ Final |
+| Histogram chunks (integer + float) | `tsdb/chunkenc/histogram*.go` | ⬜ Next |
 | Tombstones (read path) | `tsdb/tombstones/` | 🟡 (MVP writes empty) |
 
 End-to-end proven: write 20 series → flush head → block → index → query through `Block::select` → decode → recover bit-identical samples. See `tests/block/block_writer_test.cpp::CrossValidationAggregateQueryRecoversAllSeries`.
@@ -62,10 +62,10 @@ src/
   block/        Persistent block reader/writer (meta, chunks, index, ulid)
   querier/      Cross-block querier
 include/merlion_tsdb/   Public headers (mirror of src/)
-tests/        GoogleTest unit tests (~231 cases)
+tests/        GoogleTest unit tests (~254 cases)
 testdata/     Golden fixtures (Go-produced for binary parity)
 cmake/        Toolchain + helpers
-SPEC.md       The on-disk format spec (§1-§9 Final)
+SPEC.md       The on-disk format spec (§1-§10 Final)
 ROADMAP.md    Subsystem-by-subsystem status
 ```
 
@@ -82,13 +82,14 @@ std::array ms{
 };
 auto results = blk->select(ms, /*mint=*/0, /*maxt=*/INT64_MAX);
 
-// Or span multiple blocks.
+// Or span multiple blocks AND the in-memory head in one query.
 std::vector<const merlion_tsdb::block::Block*> blocks = /* ... */;
-merlion_tsdb::querier::Querier q{blocks};
+std::vector<const merlion_tsdb::head::Head*>   heads  = /* ... */;
+merlion_tsdb::querier::Querier q{blocks, heads};
 auto merged = q.select(ms, mint, maxt);
 ```
 
-`MergedSeries::chunks[i].iterator()` walks samples for each XOR chunk in `min_time` order. Sample-level overlap pruning is the caller's job (consistent with upstream's chunk-handoff contract — see SPEC §8.1).
+`MergedSeries::chunks[i].iterator()` walks samples for each XOR chunk in `min_time` order, with chunks from all sources (blocks + head) globally sorted by start time. Sample-level overlap pruning is the caller's job (consistent with upstream's chunk-handoff contract — see SPEC §8.1, §10.6).
 
 ## License
 

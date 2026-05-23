@@ -194,6 +194,75 @@ std::expected<void, std::error_code> Head::commit() {
     return wal_.sync();
 }
 
+namespace {
+
+// True iff every matcher accepts `labels`. A label that's absent is
+// treated as having the empty-string value — same semantics as
+// Block::select (see SPEC §8.2).
+bool labels_match_all(const model::Labels& labels,
+                      std::span<const model::Matcher> matchers) {
+    for (const auto& m : matchers) {
+        const auto v = labels.get(m.name());
+        if (!m.matches(v.value_or(""))) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::expected<std::vector<Head::QueryResult>, std::error_code>
+Head::select(std::span<const model::Matcher> matchers,
+             std::int64_t mint,
+             std::int64_t maxt) const {
+    if (matchers.empty()) {
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+
+    std::vector<QueryResult> out;
+    for (const auto* s : series_.all_series()) {
+        if (s == nullptr || s->num_samples() == 0) continue;
+        if (!labels_match_all(s->labels(), matchers)) continue;
+
+        QueryResult qr;
+        qr.labels = s->labels();
+
+        for (const auto* xc : s->chunks()) {
+            if (xc == nullptr || xc->num_samples() == 0) continue;
+
+            // Iterate once on the live chunk to recover (min, max). XOR
+            // emits samples in monotonic-t order so first = min, last =
+            // max. We do this BEFORE copying the bytes so we can skip
+            // non-overlapping chunks without paying for an allocation.
+            auto it = xc->iterator();
+            if (!it.next()) continue;  // structurally empty
+            const std::int64_t cmin = it.t();
+            std::int64_t cmax = cmin;
+            while (it.next()) cmax = it.t();
+            if (it.error().has_value()) {
+                return std::unexpected(std::make_error_code(std::errc::io_error));
+            }
+            // Inclusive-on-both-ends overlap test, matching §8.1.
+            if (cmin > maxt || cmax < mint) continue;
+
+            // Snapshot the chunk bytes — MemSeries may still be appended
+            // to after this call returns, so the caller must own its
+            // own copy.
+            std::vector<std::uint8_t> bytes(xc->bytes().begin(), xc->bytes().end());
+            qr.chunks.push_back(chunkenc::XORChunk::from_bytes(std::move(bytes)));
+
+            block::ChunkMeta cm;
+            cm.min_time = cmin;
+            cm.max_time = cmax;
+            cm.ref      = 0;  // in-memory chunks have no on-disk ref
+            qr.chunk_metas.push_back(cm);
+        }
+
+        if (qr.chunks.empty()) continue;
+        out.push_back(std::move(qr));
+    }
+    return out;
+}
+
 std::expected<void, std::error_code> Head::close() {
     if (closed_) return {};
     if (auto r = commit();          !r) { closed_ = true; return r; }

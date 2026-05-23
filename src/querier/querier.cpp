@@ -4,10 +4,17 @@
 #include <unordered_map>
 #include <utility>
 
+#include "merlion_tsdb/head/head.hpp"
+
 namespace merlion_tsdb::querier {
 
 Querier::Querier(std::span<const block::Block* const> blocks)
     : blocks_(blocks.begin(), blocks.end()) {}
+
+Querier::Querier(std::span<const block::Block* const> blocks,
+                 std::span<const head::Head* const>   heads)
+    : blocks_(blocks.begin(), blocks.end()),
+      heads_(heads.begin(), heads.end()) {}
 
 std::expected<std::vector<MergedSeries>, std::error_code>
 Querier::select(std::span<const model::Matcher> matchers,
@@ -34,6 +41,28 @@ Querier::select(std::span<const model::Matcher> matchers,
         if (!per_block) return std::unexpected(per_block.error());
 
         for (auto& qr : *per_block) {
+            auto [it, inserted] = bucket.try_emplace(qr.labels);
+            if (inserted) {
+                it->second.labels = qr.labels;
+            }
+            auto& dst = it->second;
+            for (std::size_t i = 0; i < qr.chunks.size(); ++i) {
+                dst.chunks.push_back(std::move(qr.chunks[i]));
+                dst.chunk_metas.push_back(qr.chunk_metas[i]);
+            }
+        }
+    }
+
+    // §10: heads merge with the same hash-bucket strategy. Heads have no
+    // meta-level time range to short-circuit on (in-memory state is
+    // open-ended); the per-chunk filter inside Head::select handles
+    // out-of-range chunks.
+    for (const auto* hd : heads_) {
+        if (!hd) continue;
+        auto per_head = hd->select(matchers, mint, maxt);
+        if (!per_head) return std::unexpected(per_head.error());
+
+        for (auto& qr : *per_head) {
             auto [it, inserted] = bucket.try_emplace(qr.labels);
             if (inserted) {
                 it->second.labels = qr.labels;

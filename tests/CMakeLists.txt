@@ -13,6 +13,7 @@ add_executable(merlion_tsdb_tests
     head/series_store_test.cpp
     head/head_test.cpp
     head/head_replay_test.cpp
+    head/head_select_test.cpp
     block/meta_test.cpp
     block/chunks_test.cpp
     block/index_test.cpp
