@@ -266,6 +266,93 @@ Identical algorithm to §2.2 but reads bytes via `read_byte` (which goes through
 
 Tests: `merlion-tsdb-cpp/tests/encoding/bstream_test.cpp` (19 cases, also passes under ASan/UBSan).
 
+### §2.5 Varbit (variable-bit-length integer) 🟡
+
+A second variable-length integer encoding, **distinct from §2.2's uvarint/varint**. Where §2.2 packs to byte boundaries (suitable for byte-oriented WAL/index records), varbit packs to **bit boundaries** inside a `bstream`. The 9-prefix bit-prefix code is tuned for histogram bucket deltas, which are typically tiny — the smallest bucket (`val == 0`) consumes a single bit.
+
+Reference: `prometheus/tsdb/chunkenc/varbit.go`. Used by §3.2 (XOR2) and §3.3 (histogram) chunks for timestamp deltas, bucket counts, span layouts, and zero-bucket counts.
+
+#### Prefix table
+
+There are two parallel forms — signed (`putVarbitInt`) and unsigned (`putVarbitUint`) — sharing the same prefix codes but interpreting the payload bits differently:
+
+| Prefix bits | Total bits | Signed range (`putVarbitInt`) | Unsigned range (`putVarbitUint`) |
+|---|---|---|---|
+| `0` | 1 | exactly 0 | exactly 0 |
+| `10` | 5 | `-3 .. +4` (3 payload bits) | `0 .. 7` |
+| `110` | 9 | `-31 .. +32` (6 payload bits) | `0 .. 63` |
+| `1110` | 13 | `-255 .. +256` (9 payload bits) | `0 .. 511` |
+| `11110` | 17 | `-2047 .. +2048` (12 payload bits) | `0 .. 4095` |
+| `111110` | 24 | `-131071 .. +131072` (18 payload bits) | `0 .. 262143` |
+| `1111110` | 32 | `-16777215 .. +16777216` (25 payload bits) | `0 .. 33554431` |
+| `11111110` | 64 | `-36028797018963967 .. +36028797018963968` (56 payload bits) | `0 .. 72057594037927935` |
+| `11111111` | 72 | full `i64` (64 payload bits) | full `u64` (64 payload bits) |
+
+The prefix is unary: zero or more `1` bits followed by a single terminating `0`, **except** the last bucket (`11111111`) which is the only one that does **not** terminate with `0` — it's 8 consecutive `1`s and the reader must special-case it. This is a subtle decoder pitfall: a naive "read bits until I see a 0" loop will read forever on the worst-case bucket.
+
+#### Signed payload semantics (two's complement folded to a finite width)
+
+The signed range above is asymmetric: e.g. for 3-bit payload, `-3 .. +4`, not `-4 .. +3`. The decode rule is:
+
+```
+sz = payload bit-width                       # 3, 6, 9, 12, 18, 25, 56
+bits = read_bits(sz)                          # zero-extended uint
+if bits > (1 << (sz - 1)):                    # NOTE: strict >, not >=
+    bits -= (1 << sz)                         # interpret as negative two's complement
+val = bits as i64
+```
+
+The strict `>` (rather than `>=`) is what shifts the asymmetric range one notch toward positive values. Off-by-one here will silently push every value at the bucket boundary into the wrong sign.
+
+The 64-bit terminal bucket (`11111111`) skips the sign-fold dance and reads the value as a raw `i64` — `int64(read_bits(64))`.
+
+#### `bit_range(val: i64, n: u8) -> bool`
+
+The dispatch predicate used by the encoder to decide which bucket to emit:
+
+```
+bit_range(val, n) = -(1 << (n - 1)) + 1 <= val <= (1 << (n - 1))
+                  ≡  -(2^(n-1) - 1)       <= val <=  2^(n-1)
+```
+
+Identical asymmetric range to the §3.1 XOR dod check, and the same off-by-one pitfall.
+
+#### Decoder skeleton (combined for both forms)
+
+```
+# read prefix
+d = 0
+for _ in 0..8:
+    d <<= 1
+    if read_bit() == 0: break
+    d |= 1                                    # accumulate the consecutive 1s
+
+match d:
+    0b0:        return 0
+    0b10:       sz = 3
+    0b110:      sz = 6
+    0b1110:     sz = 9
+    0b11110:    sz = 12
+    0b111110:   sz = 18
+    0b1111110:  sz = 25
+    0b11111110: sz = 56
+    0b11111111: return read_bits(64) as i64   # signed; or as u64 for unsigned form
+
+bits = read_bits(sz)
+# Apply the sign-fold above only for putVarbitInt; putVarbitUint returns bits as-is.
+```
+
+#### Pitfalls
+
+1. **Terminal bucket doesn't terminate with `0`.** `0b11111111` is the only 8-bit prefix without a trailing `0`. A "read until `0`" loop must cap at 8 iterations and treat 8-consecutive-`1`s as the explicit `0b11111111` bucket.
+2. **Asymmetric signed range.** `-3..+4`, not `-4..+3`. The strict-`>` test in the sign fold is load-bearing.
+3. **No prefix is byte-aligned.** Unlike §2.2 varint, varbit values are arbitrary bit lengths (1, 5, 9, 13, 17, 24, 32, 64, 72 bits). Always emit/consume via `BitWriter::write_bits` and `BitReader::read_bits` — do not try to byte-align.
+4. **Encoder must use `bit_range` (signed) and `bit_range_uint` (unsigned).** Reusing the signed predicate for unsigned values misclassifies values like `4` (fits in 3 unsigned bits = bucket `10`) versus `4i64` (also fits) — happens to work, but the boundary values differ. The unsigned check is `leading_zeros(val) >= 64 - n`.
+
+#### Test vectors
+
+To be pinned once the C++ varbit implementation lands. The Go reference test is `prometheus/tsdb/chunkenc/varbit_test.go`; cross-impl validation will piggyback on the histogram chunk roundtrip rather than ship a standalone fuzzer.
+
 ---
 
 ## §3. Chunk encoders
@@ -413,13 +500,255 @@ value = f64::from_bits(value.to_bits() ^ (bits << trailing))
 
 Newer encoding adding stale-NaN markers and start-timestamp (ST) support. The control-prefix code has six cases instead of five. To be specified when implemented in C++. Reference: `prometheus/tsdb/chunkenc/xor2.go` and `bstreamReader::readXOR2Control`.
 
-### §3.3 Histogram (`Encoding::Histogram`, tag = 2) ⬜
+### §3.3 Integer histogram (`Encoding::Histogram`, tag = 2) 🟡
 
-Sparse histogram chunk. Reference: `prometheus/tsdb/chunkenc/histogram.go`.
+Sparse exponential (or custom-bucket) histograms with integer bucket counts. Each sample carries: an absolute count, a zero-bucket count, an f64 sum, and two parallel bucket arrays (positive and negative). The chunk encoder amortizes the bucket-layout description (schema, zero threshold, span layouts) across all samples — the layout is pinned by sample 0 and every subsequent sample must conform to it (or the appender refuses and the caller cuts a new chunk).
+
+Reference: `prometheus/tsdb/chunkenc/histogram.go` (1359 LOC), `prometheus/tsdb/chunkenc/histogram_meta.go` (layout helpers), `prometheus/tsdb/chunkenc/varbit.go` (see §2.5).
+
+#### Chunk header — 3 bytes (not 2)
+
+Unlike §3.1 XOR's 2-byte header, the integer-histogram header is **3 bytes**:
+
+```
+offset 0-1   u16 BE   num_samples (header_size_for_num_samples = 2)
+offset 2     u8       counter-reset header in high 2 bits; low 6 bits reserved (must be 0)
+```
+
+The bit stream of compressed sample data starts at byte offset 3.
+
+##### CounterResetHeader (byte 2, bits 7-6)
+
+| Bits 7-6 | Value name | Meaning |
+|---|---|---|
+| `00` | `UnknownCounterReset` | Cannot say if a counter reset triggered this chunk. Reader must run explicit counter-reset detection at query time. Default for newly created chunks. |
+| `01` | `NotCounterReset` | The chunk's first sample is definitely NOT a counter reset (the previous chunk's last sample was monotonically ≤ this one). |
+| `10` | `CounterReset` | The chunk's first sample IS a counter reset relative to the previous chunk. |
+| `11` | `GaugeType` | This chunk holds a **gauge histogram** — counts can move freely in both directions; reset detection is meaningless and skipped entirely. |
+
+The header is written exactly once, when sample 0 is appended. Subsequent samples do NOT update it. The mask is `0b11000000` — both the encoder and reader must mask/clear the low 6 bits before storing or comparing.
+
+##### Header pitfalls
+
+- The header is `3` bytes, **not** `2` like §3.1. Both the sample-count read and the bit-stream start offset must account for the extra byte.
+- The reserved 6 bits in byte 2 are not officially "future-proofed" anywhere — they should be left `0` so a future version's flag bits don't collide.
+
+#### Layout block (emitted exactly once, before sample 0's data)
+
+After the 3-byte header, sample 0 begins by writing the **layout description** — every subsequent sample inherits this layout silently and must match it bucket-for-bucket. Order:
+
+1. **Zero threshold** — variable size, see below.
+2. **Schema** — signed varbit (§2.5). Typical exponential-bucket range: `-4 .. +8`. Negative values denote custom-bucket schemas; current custom-bucket schema is `-53`.
+3. **Positive spans list** — see "Spans" below.
+4. **Negative spans list** — same encoding as positive.
+5. **Custom bounds** — present **only if** the schema indicates a custom-bucket histogram (`IsCustomBucketsSchema(schema)`). Encoded as varbit-uint count followed by per-bound encoding (see "Custom bounds" below).
+
+##### Zero threshold encoding
+
+```
+if threshold == 0:
+    write_byte(0x00)
+elif threshold is a power of 2 in [2^-243, 2^10]:    # mantissa==0.5 after frexp; exponent in [-242, +11]
+    write_byte((exponent + 243) as u8)               # produces byte in [0x01, 0xFE]
+else:
+    write_byte(0xFF)
+    write_bits(threshold.to_bits(), 64)
+```
+
+The default Prometheus zero threshold is `2^-128`, which encodes to a single byte (`0x74` = 116). The `0xFF` escape applies the same `f64` raw-bits encoding §3.1 uses for the first XOR sample's value.
+
+Reader inverse: read 1 byte, dispatch on `0x00` / `0xFF` / other. For "other", reconstruct via `ldexp(0.5, byte - 243)`.
+
+##### Spans (positive and negative, same encoding for both)
+
+A span list describes the *shape* of the bucket array: which logical bucket indices are populated and which are gaps. The bucket-count array (emitted per-sample below) holds **one entry per populated bucket**, in span order.
+
+```
+write_varbit_uint(spans.len())
+for span in spans:
+    write_varbit_uint(span.length)     # u32 in source; encoded as varbit-uint
+    write_varbit_int(span.offset)      # i32 in source; encoded as varbit-int (relative offset)
+```
+
+The empty span list is a single `0` bit (varbit-uint encoding of 0). Each span's `offset` is the number of unpopulated buckets between the previous span (or the start) and this one — so the on-wire offsets are deltas, not absolute logical indices. For gauge histograms the offset can be negative.
+
+##### Custom bounds (only if schema is custom-bucket)
+
+Most bounds are reasonable decimals — Prometheus optimizes for "millisecond-precision" values fitting in 25 unsigned-varbit bits:
+
+```
+write_varbit_uint(custom_values.len())
+for bound in custom_values:
+    tf = bound * 1000.0
+    if tf < 0 || tf > 33_554_430 || tf is not a whole number:
+        write_bit(0)
+        write_bits(bound.to_bits(), 64)
+    else:
+        write_varbit_uint(round(tf) as u64 + 1)        # +1 so the encoding's leading bit is always 1
+```
+
+The `+1` is what disambiguates the two arms on read: a varbit-uint of 0 (single `0` bit) means "the next 64 bits are an `f64`"; any non-zero varbit-uint is `tf + 1`, recover with `(varbit_value - 1) / 1000.0`.
+
+#### Sample 0 (sample data, after layout)
+
+```
+write_varbit_int(t)                                 # absolute timestamp
+write_varbit_uint(count)                            # total observations
+write_varbit_uint(zero_count)                       # zero-bucket count
+write_bits(sum.to_bits(), 64)                       # raw f64 (mirrors §3.1)
+for b in positive_buckets:
+    write_varbit_int(b)                             # see "Bucket value semantics" below
+for b in negative_buckets:
+    write_varbit_int(b)
+```
+
+`positive_buckets.len() == sum(positive_spans[i].length)` and the same for negative.
+
+##### Stale-NaN sample 0
+
+If `Float64::is_stale_nan(sum)` — Prometheus's signaling-NaN convention for "scrape failed" — the appender rewrites the histogram to `{sum: stale_nan, count: 0, zero_count: 0, positive_buckets: [], negative_buckets: [], positive_spans: [], negative_spans: []}` BEFORE writing. So sample 0 in a stale-NaN-led chunk has empty spans (single `0` bit each) and no bucket bytes.
+
+#### Sample N (N ≥ 1)
+
+```
+write_varbit_int(t_dod)                             # = (t - t_prev) - t_delta_prev
+write_varbit_int(count_dod)                         # = (count - count_prev) - count_delta_prev
+write_varbit_int(zero_count_dod)                    # same form
+xor_write(sum, sum_prev, &mut leading, &mut trailing)  # §3.1 xor_write, sum reuses XOR state
+for i in 0..positive_buckets.len():
+    delta = positive_buckets[i] - last_positive_buckets[i]      # cross-sample per-bucket delta
+    dod   = delta - last_positive_bucket_deltas[i]
+    write_varbit_int(dod)
+    last_positive_bucket_deltas[i] = delta
+for i in 0..negative_buckets.len():
+    delta = negative_buckets[i] - last_negative_buckets[i]
+    dod   = delta - last_negative_bucket_deltas[i]
+    write_varbit_int(dod)
+    last_negative_bucket_deltas[i] = delta
+```
+
+Notes:
+
+- **No 5-prefix dod code.** Unlike §3.1's variable-prefix `0` / `10` / `110` / `1110` / `1111` code for timestamps, the histogram chunk uses **varbit signed** (§2.5) for *every* delta-of-delta field — timestamp, count, zero count, and per-bucket. This is the same encoding as the layout fields, just applied to delta-of-delta values instead of absolutes.
+- **Sample 1 is not special-cased on the wire.** The encoder always emits `dod = delta - delta_prev`. For sample 1, `delta_prev` is `0` (state initialized to zero), so the dod equals the first delta exactly. The decoder mirrors this — no separate sample-1 branch.
+- **Sum reuses the XOR engine.** `xor_write` (§3.1) compresses the f64 sum with the same `leading`/`trailing` window state machinery as XOR chunks. The state lives in the appender, carries across samples, and uses the same `0xFF` sentinel for "not yet initialized".
+
+##### Bucket value semantics — important
+
+The `positive_buckets[i]` values passed in (and written on the wire) are **already inter-position deltas at the API level** — Prometheus's `histogram.Histogram` struct stores buckets in delta-encoded form across the populated bucket positions of a single sample. So when sample 0 writes `write_varbit_int(b)` for each bucket, position 0 is the absolute count of bucket 0 and positions ≥ 1 are deltas from their immediate predecessor inside the same sample.
+
+That means the encoder treats each bucket position **independently across samples**: the cross-sample delta for position `i` is `bucket[i] - last_bucket[i]`, not `(running_count[i]) - (last_running_count[i])`. The dod chain is per-position.
+
+This convention lets a single chunk hold ~hundreds of buckets with delta-of-delta compression as cheap per bucket as it is for a single timestamp series.
+
+##### Stale-NaN sample N
+
+If `is_stale_nan(sum)`:
+
+```
+count_dod = 0                                       # force zero, overriding what was computed
+zero_count_dod = 0                                  # same
+write_varbit_int(t_dod)                             # normal
+write_varbit_int(0)                                 # count_dod, forced
+write_varbit_int(0)                                 # zero_count_dod, forced
+xor_write(stale_nan, sum_prev, ...)                 # writes the stale NaN's bit pattern
+# NO BUCKET LOOP — h.PositiveBuckets and h.NegativeBuckets are nil for a stale-rewritten sample.
+```
+
+Then **`num_samples` is still incremented**. So a stale-NaN sample N has a shorter wire footprint than a normal sample N: 3 varbit-ints + the xor-sum + zero bucket bytes. The decoder must detect the stale sum from the xor-decode and skip the bucket loop, or else it'll consume some other sample's bytes as bucket data and corrupt the stream irreversibly.
+
+#### Appender refusal rules
+
+`AppendHistogram` returns `(ok_to_append: bool, inserts: ...)` instead of just writing. The caller (typically `Head`) cuts a new chunk on `false`. The chunk is **not appendable** if any of:
+
+1. **Schema changed** — `h.schema != chunk_schema`.
+2. **Zero threshold changed** — `h.zero_threshold != chunk_zero_threshold`.
+3. **Custom bounds changed** — for custom-bucket schemas, any difference in the bounds vector.
+4. **Count decreased** — `h.count < last_count` (signals a counter reset, except for gauge type).
+5. **Zero count decreased** — `h.zero_count < last_zero_count` (same).
+6. **Bucket layout incompatible** — new span layout requires removing buckets the chunk already has, OR a span change that cannot be expressed via "insert empty buckets into the existing layout".
+7. **Explicit counter-reset hint** — caller's hint is `CounterReset` regardless of the actual count values.
+8. **Stale → non-stale transition** — previous sample's sum was stale-NaN and the current sample's isn't.
+
+Cases 1, 2, 3, 7 always require a new chunk. Cases 4, 5, 6 with `GaugeType` chunks are bypassed (gauges don't have counter resets).
+
+##### Forward-compatible bucket insertion (recoding)
+
+If the new sample adds new populated buckets that the chunk's layout doesn't yet have, BUT the existing buckets remain, the appender can **recode** the chunk in place: rewrite every existing sample's bucket delta stream to include zero-deltas at the new positions, then append the new sample normally. Recoding is expensive (decode + re-encode every sample) but lets a chunk absorb gradual bucket growth without cutting prematurely.
+
+The recode entry point is `HistogramAppender.recode()` (histogram.go:669) and the per-sample expansion helper is `expandIntSpansAndBuckets` (histogram_meta.go). A reimplementation may defer recoding (always cut a new chunk on layout drift) without breaking format compatibility — only write latency suffers.
+
+#### Iterator state
+
+Beyond the §3.1 XOR state (`t`, `t_delta`, `leading`, `trailing`):
+
+- `count`, `count_delta`, `zero_count`, `zero_count_delta`
+- `positive_buckets[]`, `positive_bucket_deltas[]` (parallel arrays, both length = sum of positive span lengths)
+- `negative_buckets[]`, `negative_bucket_deltas[]` (same)
+- The full layout: `schema`, `zero_threshold`, `positive_spans`, `negative_spans`, `custom_values`
+
+The iterator decodes the layout once (during sample 0), then carries it through the chunk. The per-bucket arrays grow to match the layout's bucket count and never resize — recoding builds a new chunk's iterator state from scratch.
+
+#### Invariants
+
+- The 3-byte header is **mandatory**, even for an empty chunk. An "empty" chunk's bytes are `[0x00, 0x00, 0x00]`.
+- `num_samples` (header bytes 0-1) is updated **after** the bit-stream writes succeed, identical to §3.1's discipline.
+- The layout block is written exactly once, by sample 0. If the chunk is empty (no appends yet), no layout bytes exist — appending the first sample writes both the layout and the sample-0 data atomically.
+- For empty span lists (a histogram with no populated positive or negative buckets), the varbit-uint of `0` consumes a single bit. Two empty span lists therefore cost 2 bits in the layout block — there is no per-list framing overhead.
+- The counter-reset header bits in byte 2 are immutable after sample 0. The reader must mask byte 2 with `0b11000000` before comparison.
+
+#### Bounds
+
+- `TARGET_BYTES_PER_HISTOGRAM_CHUNK = 1024` — same as §3.1, but a **soft** target. The chunk-cut decision happens at a higher layer (`HeadAppender` checks the byte count after each append); the encoder itself has no per-write byte cap.
+- `MIN_SAMPLES_PER_HISTOGRAM_CHUNK = 10` — guards against pathologically tiny chunks. Below this floor the head defers cutting even if the byte count exceeds the target.
+- `num_samples` cap: `u16::MAX = 65_535`. Same as §3.1.
+- No explicit max span count or max bucket count.
+
+#### Reading
+
+The decoder is the strict inverse and matches the appender step-for-step:
+
+1. Read 3-byte header. Save the masked counter-reset bits; capture `num_total`.
+2. Decode the layout block (zero threshold, schema, positive spans, negative spans, [custom values]).
+3. For each of `num_total` samples:
+   - **Sample 0**: `read_varbit_int(t)`, `read_varbit_uint(count)`, `read_varbit_uint(zero_count)`, `read_bits(64)` for sum, then bucket vectors.
+   - **Sample N ≥ 1**: `read_varbit_int(t_dod)`, `read_varbit_int(count_dod)`, `read_varbit_int(zero_count_dod)`, `xor_read(sum, &mut leading, &mut trailing)`, then per-bucket `read_varbit_int(dod)` for each position — **unless** the decoded sum is stale-NaN, in which case skip the bucket loop.
+
+The iterator must propagate the layout-derived bucket count to its delta arrays — there is no per-sample bucket-count prefix on the wire.
+
+#### Pitfalls (histogram-specific)
+
+| # | Pitfall |
+|---|---|
+| 20 | **Header is 3 bytes, not 2.** Both the sample-count read and the bit-stream start offset differ from §3.1. |
+| 21 | **Layout block is written once by sample 0, not by the constructor.** An "empty" chunk has no layout bytes — first append must write the layout *before* sample 0's data, atomically. |
+| 22 | **Varbit `11111111` prefix doesn't terminate with `0`.** A "read bits until I see a `0`" loop will overrun. Cap at 8 iterations. |
+| 23 | **Bucket arrays are pre-delta-encoded across positions** at the API level. The chunk encoder doesn't compute inter-position deltas itself — it trusts the input. Cross-sample dod is per-position-independently. |
+| 24 | **Stale-NaN samples write no bucket bytes**, but still increment `num_samples`. Reader must detect stale sum and skip the bucket loop, or it'll consume the next sample's bytes. |
+| 25 | **Stale-NaN samples force `count_dod = zero_count_dod = 0`** even if the appender computed something else. The decoder doesn't need to special-case this — it just reads what's on the wire — but anyone diffing against "expected dods from counter math" will see what looks like a bug. |
+| 26 | **The 14-bit / 17-bit / 20-bit XOR dod prefix code is NOT used here.** Histograms put every dod through varbit (§2.5), which has different bucket boundaries — `bit_range(val, 3)` for the smallest non-zero bucket, holding `-3..+4`. A port that copies XOR's prefix tables verbatim will produce byte-incompatible histogram chunks. |
+| 27 | **Recoding mutates an existing chunk in place.** A reimplementation MAY skip recoding (always cut a new chunk on layout drift) — this produces format-valid output, just more chunks per series than upstream. |
+| 28 | **Zero threshold's 1-byte encoding is offset by 243.** `byte = exponent + 243`, valid for `exponent ∈ [-242, +11]`. Default threshold `2^-128` → byte `0x74`. |
+| 29 | **CounterResetHeader writes only the high 2 bits of byte 2.** Leave the low 6 bits zero — they're reserved. Writing them as nonzero today is technically format-valid (the reader masks them off) but breaks forward compatibility if Prometheus claims any of them. |
+
+#### Reference implementations
+
+- **Go**: `prometheus/tsdb/chunkenc/histogram.go` (encoder + decoder + appender refusal + recode), `histogram_meta.go` (layout helpers + spans + zero threshold + custom bounds), `varbit.go` (the bit-prefix code shared with §3.2 XOR2).
+- **C++**: not yet implemented.
+- **Rust**: not yet implemented.
+
+#### Next steps before promotion to ✅ Final
+
+This section is **🟡 Drafted** — it's a contract describing what the bytes look like. Promotion to ✅ Final requires:
+
+1. A working integer-histogram chunk encoder + decoder in at least one of `merlion-tsdb-cpp` / `merlion-tsdb-rs`.
+2. Test vectors pinned in the spec (today: cross-references to `prometheus/tsdb/chunkenc/histogram_test.go`).
+3. A roundtrip test that decodes a Go-produced histogram chunk byte-for-byte (or vice versa).
+4. The §2.5 varbit primitive implemented and tested standalone.
 
 ### §3.4 Float histogram (`Encoding::FloatHistogram`, tag = 3) ⬜
 
-Reference: `prometheus/tsdb/chunkenc/float_histogram.go`.
+Structurally identical to §3.3 but every count/bucket field is `f64` instead of `i64` (the timestamp delta-of-deltas and the layout block are unchanged; only the sum, count, zero count, and bucket counts switch from varbit-int/uint to xor-encoded f64s). To be drafted alongside the float-histogram implementation. Reference: `prometheus/tsdb/chunkenc/float_histogram.go`.
 
 ---
 
@@ -1179,6 +1508,16 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 17. **Postings offset table entries are NOT pre-sorted by (name, value).** They're written in the writer's internal iteration order. Build a hash map at read time; don't binary-search.
 18. **Upstream writes V2, accepts V1/V2/V3.** Emitting V3 (the version byte = 3) is technically allowed but only V3 readers handle it. Emit V2 (version byte = 2) for maximum compatibility — V2 and V3 are byte-identical at write time.
 19. **ULID first character is `'0'..'7'`.** Only 3 of its 5 bits are payload; the other 2 are the synthetic zero-padding that rounds 128 ULID bits up to 130 = 26 × 5.
+20. **Integer histogram chunk header is 3 bytes, not 2.** Byte 2 is the CounterResetHeader byte (high 2 bits used, low 6 reserved). Both the sample-count read and the bit-stream start offset differ from §3.1's 2-byte XOR header.
+21. **Histogram layout block is written by the first append, not by chunk construction.** An empty histogram chunk is just `[0x00, 0x00, 0x00]` — first append writes the layout (zero threshold + schema + spans + [custom bounds]) atomically with sample 0's data. There is no separate "init layout" step.
+22. **Varbit `0b11111111` terminal prefix doesn't end in `0`.** Eight consecutive `1`s is the explicit "next 64 bits are the value" escape — a "read bits until I see `0`" prefix loop must cap at 8 iterations or it'll run forever on the worst-case bucket.
+23. **Histogram bucket arrays are pre-delta-encoded across positions at the API level.** The chunk encoder writes each `PositiveBuckets[i]` directly via varbit-int — position 0 is the absolute count, positions ≥ 1 are deltas from the previous *position* inside the same sample. Cross-sample delta-of-delta is computed per-position-independently.
+24. **Stale-NaN histogram samples write no bucket bytes but still bump `num_samples`.** The decoder must detect the stale-NaN sum after `xor_read` and skip the bucket loop. Reading bucket bytes anyway will consume the *next* sample's bytes and corrupt the stream.
+25. **Stale-NaN sample N+ forces `count_dod = zero_count_dod = 0`** on write, overriding what the appender's running deltas would have produced. The reader doesn't need to special-case this — it just consumes what's on the wire — but anyone diffing against expected-from-counter-math will see the override.
+26. **Histograms use varbit (§2.5) for timestamp dod, NOT the 5-prefix XOR dod code (§3.1).** Copying the XOR prefix tables verbatim into a histogram port produces byte-incompatible output. The buckets, count, zero count, and timestamp deltas all go through the same varbit-int encoder.
+27. **Histogram zero-threshold 1-byte encoding is `exponent + 243`.** Valid only for thresholds that are powers of 2 in `[2^-243, 2^10]`. Default `2^-128` → byte `0x74`. Out-of-range values escape via the `0xFF` prefix + raw 8-byte f64.
+28. **CounterResetHeader bits live in byte 2's high 2 bits only.** The low 6 bits are reserved and must be written as 0; the reader masks with `0b11000000` before comparison. Writing nonzero low bits today happens to work (mask drops them) but breaks any future Prometheus claim on those bits.
+29. **Histogram chunk appender refuses on layout drift; recoding is opt-in.** If schema / zero threshold / span layout changes, `AppendHistogram` returns `okToAppend = false` and the caller must cut a new chunk. Upstream offers `recode()` to absorb forward-compatible bucket-insert drift in place; a reimplementation MAY skip recoding (always cut new chunks) without breaking format compatibility, at the cost of more chunks per series.
 
 ---
 
@@ -1190,6 +1529,10 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 - **mbits / sigbits** — significant bits = `64 - leading - trailing`.
 - **ULID** — 26-character lexicographic UUID; used as block directory name.
 - **TOCTOU** — time-of-check-to-time-of-use; here, racing the chunk's last byte between concurrent reader and writer.
+- **varbit** — variable-bit-length integer encoding (§2.5). Distinct from §2.2's byte-oriented varint. Used by histograms (§3.3, §3.4) and XOR2 (§3.2) for tightly-packed deltas.
+- **span (histogram)** — a contiguous run of populated bucket positions inside a histogram. `Span{Offset, Length}` says "skip `Offset` buckets after the previous span, then this span covers `Length` positions". The on-wire offset is relative, not absolute.
+- **CounterResetHeader** — high-2-bits flag in byte 2 of an integer histogram chunk indicating whether sample 0 is a counter reset. Four values: Unknown / Not / Yes / Gauge.
+- **schema (histogram)** — the bucket-boundary basis. Exponential schemas use small integers (`-4..+8`); custom-bucket schemas use negative integers and emit explicit bounds in the layout block.
 
 ---
 
@@ -1201,3 +1544,4 @@ Real bugs encountered or anticipated during porting. Each line is a "do not repe
 - **2026-05-23** — §7 promoted to vertical-merge with sample-level dedup (last-input-wins); previous "verbatim concat" wording removed. §8 Querier added (matchers + time-range filter + posting-list intersect). `merlion-tsdb-cpp` carries 222 passing tests (Debug + ASan/UBSan).
 - **2026-05-23** — §9 Cross-block Querier added: hash-bucket merge of per-block `select` results, chunks sorted by min_time across blocks, block-level time-range short-circuit. `merlion-tsdb-cpp` carries 231 passing tests (Debug + ASan/UBSan).
 - **2026-05-24** — §10 Head querier added: `Head::select` mirrors `Block::select` (matcher + time-range filter + chunk snapshot), and `querier::Querier` gains a second constructor accepting `Head*` alongside `Block*` so a single query can mix in-memory and on-disk data. Snapshot semantics: head chunks are copied at `select` time so the result outlives further appends. `merlion-tsdb-cpp` carries 254 passing tests (Debug + ASan/UBSan).
+- **2026-05-24** — §3.3 integer histogram chunk format **Drafted** (🟡, not yet Final — no implementation). The contract is byte-pinned: 3-byte header (sample count + CounterResetHeader), layout block (zero threshold + schema + spans + optional custom bounds), sample 0 absolute encoding, sample N delta-of-delta encoding (all varbit; sum via XOR's `xor_write`). Includes appender refusal rules + recoding semantics. New §2.5 documents the varbit primitive (9-prefix code, asymmetric signed range) shared with §3.2 (XOR2). Pitfalls catalogue grown to 29 entries (10 new histogram-specific). Promotion to ✅ Final requires at least one passing roundtrip implementation.
