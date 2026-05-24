@@ -27,7 +27,7 @@ Legend: ✅ landed · 🟡 in progress · ⬜ not started · ⬛ out of scope
 | 15 | `block::select` (matchers + time range) | ✅ | ⬜ | §8 ✅ | Posting-list intersect, empty-value PromQL semantics |
 | 16 | `querier::Querier` (cross-block) | ✅ | ⬜ | §9 ✅ | Hash-bucket merge, chunks sorted by min_time |
 | 17 | `head::select` + unified Querier (Head + Block) | ✅ | ⬜ | §10 ✅ | Snapshot copies, chunks sorted across sources |
-| 18 | `chunkenc/histogram` (integer + float) | ⬜ | ⬜ | §3.3-3.4 ⬜ | Reuses xor_write primitive |
+| 18 | `chunkenc/histogram` (integer + float) | ⬜ | ⬜ | §3.3 🟡 / §3.4 ⬜ | §3.3 byte format drafted; §2.5 varbit added; awaiting impl |
 | 19 | `tombstones` (per-series deletion intervals) | 🟡 | ⬜ | §6.8 🟡 | MVP writes empty file; read deferred |
 | 20 | Cross-impl byte-level validation harness | ⬜ | ⬜ | — | Go fixturegen tool + diff |
 | — | PromQL / scrape / discovery / UI | ⬛ | ⬛ | — | Separate projects, not this repo |
@@ -37,7 +37,7 @@ Legend: ✅ landed · 🟡 in progress · ⬜ not started · ⬛ out of scope
 ## Next milestones
 
 ### C++ side
-1. **`chunkenc/histogram`** — integer and float histogram encoders (§3.3, §3.4). Reuses `xor_write` primitive. Spec sections are placeholders; drafting comes with implementation.
+1. **`chunkenc/histogram`** — integer histogram encoder + decoder per §3.3 (drafted). First milestone: standalone §2.5 varbit primitive + roundtrip tests. Then the 3-byte header + layout block + sample 0/N encoders. Float histogram (§3.4) follows once §3.3 lands.
 2. **Tombstone read path** — currently MVP writes an empty tombstones file (§6.8). Reading + applying deletion intervals at query time is deferred.
 3. **Cross-impl validation harness** — small Go fixturegen tool emitting deterministic bytes per encoder, so the matrix below becomes mechanical.
 4. **Snapshot stability under concurrent appends** — §10 MVP is single-threaded. Production needs stripe-locked appender ↔ select coordination so `Querier::select` returns consistent snapshots while writers keep running.
@@ -70,6 +70,7 @@ A small Go program at `tools/fixturegen/` (planned, not yet started) will emit d
 
 | Date | PR | What |
 |---|---|---|
+| 2026-05-24 | [#28](https://github.com/MerlionOS/merlion-tsdb-cpp/pull/28) | docs(spec): §3.3 integer histogram chunk byte format Drafted; new §2.5 varbit primitive; pitfalls #20-29 |
 | 2026-05-24 | [#27](https://github.com/MerlionOS/merlion-tsdb-cpp/pull/27) | §10 head querier — `Head::select` + unified Querier(Head+Block); snapshot copies; sort across sources |
 | 2026-05-23 | [#26](https://github.com/MerlionOS/merlion-tsdb-cpp/pull/26) | Docs refresh: ROADMAP + README synced to §1-§9 Final |
 | 2026-05-23 | [#25](https://github.com/MerlionOS/merlion-tsdb-cpp/pull/25) | §9 cross-block Querier — hash-bucket merge, chunks sorted across blocks |
